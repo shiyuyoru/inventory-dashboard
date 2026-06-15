@@ -3,9 +3,19 @@ import pandas as pd
 import re
 import io
 import plotly.express as px
-st.set_page_config(page_title="库存系统V3-决策版", layout="wide")
-st.title("📦 库存决策系统（V3）")
-file = st.file_uploader("上传Excel", type=["xlsx"])
+st.set_page_config(page_title="库存决策系统", layout="wide")
+st.markdown("""
+<style>
+  .stApp { background: #f8fafc; }
+  header[data-testid="stHeader"] { background: transparent !important; }
+  .stTabs [data-baseweb="tab"] { font-weight: 500; border-radius: 8px 8px 0 0; padding: 8px 16px; }
+  .stExpander { border-radius: 10px; border: 1px solid #e2e8f0; box-shadow: none; }
+  div[data-testid="stMetric"] { background: white; border-radius: 10px; padding: 12px; border: 1px solid #f1f5f9; }
+  .stPlotlyChart { background: white; border-radius: 12px; padding: 12px; border: 1px solid #f1f5f9; box-shadow: 0 1px 2px rgba(0,0,0,0.04); }
+</style>
+""", unsafe_allow_html=True)
+st.title("库存决策系统")
+file = st.file_uploader("上传 Excel 文件", type=["xlsx"])
 # =========================
 # ① 产品识别（只保留 LW / DT）
 # =========================
@@ -36,11 +46,11 @@ LEVEL_THRESHOLD  = {
     "死库存":  "死库存（90天销量 = 0）",
 }
 COLOR_MAP = {
-    "热销":   "#00e676",
-    "主销":   "#448aff",
-    "弱动销": "#ffab00",
-    "滞销":   "#ff1744",
-    "死库存":  "#546e7a",
+    "热销":   "#10b981",
+    "主销":   "#6366f1",
+    "弱动销": "#f59e0b",
+    "滞销":   "#ef4444",
+    "死库存":  "#94a3b8",
 }
 # =========================
 # 缓存预处理
@@ -78,7 +88,6 @@ if file:
         df_pie = df_pie[df_pie["数量"] > 0]
         if df_pie.empty:
             return None
-        total = sum(values)
         fig = px.pie(
             df_pie,
             names="等级",
@@ -86,37 +95,27 @@ if file:
             color="等级",
             color_discrete_map=color_map,
             category_orders={"等级": LEVEL_ORDER},
-            hole=0.52,
+            hole=0.4,
         )
         fig.update_traces(
             textposition="inside",
             textinfo="percent",
-            textfont_size=11,
-            textfont_color="#cbd5e1",
-            textfont_family="Courier New, monospace",
-            marker=dict(line=dict(color="#0b1120", width=2.5)),
+            textfont_size=12,
+            textfont_color="#475569",
+            marker=dict(line=dict(color="white", width=2)),
             hovertemplate="<b>%{label}</b><br>%{value} 个<br>%{percent}<extra></extra>",
         )
-        fig.add_annotation(
-            x=0.5, y=0.5,
-            text=f"<b>{total}</b>",
-            font=dict(size=18, color="#e2e8f0", family="Courier New, monospace"),
-            showarrow=False,
-        )
         fig.update_layout(
-            title=dict(
-                text=title,
-                font=dict(size=12, color="#94a3b8", family="Courier New, monospace"),
-            ),
+            title=dict(text=title, font=dict(size=13, color="#64748b")),
             showlegend=False,
-            margin=dict(t=45, b=10, l=10, r=10),
-            height=270,
-            paper_bgcolor="#0b1120",
-            plot_bgcolor="#0b1120",
+            margin=dict(t=40, b=10, l=10, r=10),
+            height=240,
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
         )
         return fig
     def render_brand(df_brand, brand):
-        st.header(f"🏷️ {brand} 品牌")
+        st.header(brand)
         if df_brand.empty:
             st.info("无该品牌产品")
             return
@@ -138,7 +137,7 @@ if file:
         else:
             sku = None
         # ======== 产品层 ========
-        st.subheader("📦 产品")
+        st.subheader("产品")
         # 饼状图：数量占比 + 金额占比
         c1, c2 = st.columns(2)
         with c1:
@@ -171,7 +170,7 @@ if file:
                     )
         st.divider()
         # ======== SKU 层 ========
-        st.subheader("🏷️ SKU")
+        st.subheader("SKU")
         if sku is None:
             st.info("未识别到 SKU 列")
             return
@@ -206,7 +205,7 @@ if file:
                         hide_index=True
                     )
     # ======== 两个 Tab ========
-    tab_lw, tab_dt = st.tabs(["🏷️ LW品牌", "🏷️ DT品牌"])
+    tab_lw, tab_dt = st.tabs(["LW", "DT"])
     with tab_lw:
         render_brand(df_lw, "LW")
     with tab_dt:
