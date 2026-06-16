@@ -532,14 +532,42 @@ def render_leader_tab(prod_lw, prod_dt, col_amount):
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-    # ---- 表格 ----
-    display_cols = ["产品ID", "品牌", "可用库存", "90天内销量", "产品健康评分", "处理优先级", "建议动作", "处理原因"]
+    # ---- 按优先级分组展示 ----
+    display_cols = ["产品ID", "品牌", "可用库存", "90天内销量", "产品健康评分", "建议动作", "处理原因"]
     if col_amount:
         display_cols.insert(3, col_amount)
-    st.dataframe(
-        leader[[c for c in display_cols if c in leader.columns]],
-        use_container_width=True, hide_index=True,
-    )
+
+    priority_groups = [
+        ("P0", "🔴 必须立刻处理", [
+            "• 死库存且库存金额 ≥ ¥3,000",
+            "• 90天销量 < 30 且可用库存 ≥ 500",
+            "• 90天销量 < 30 且库存金额 ≥ ¥3,000",
+        ]),
+        ("P1", "🟠 本月优先处理", [
+            "• 90天销量 < 30 且可用库存 ≥ 100",
+            "• 弱动销且库存金额 ≥ ¥3,000",
+        ]),
+        ("P2", "🟡 观察处理", [
+            "• 低销量但库存金额不高",
+            "• 需持续观察的产品",
+        ]),
+    ]
+
+    for pri, title, criteria in priority_groups:
+        sub = leader[leader["处理优先级"] == pri]
+        if sub.empty:
+            continue
+        sub_amt = sub[col_amount].sum() if col_amount else 0
+        criteria_text = " ｜ ".join(criteria)
+        st.markdown(f"### {title} — {len(sub)} 个产品")
+        st.caption(f"触发条件：{criteria_text}")
+        if col_amount:
+            st.caption(f"小计金额：¥{sub_amt:,.0f}")
+        st.dataframe(
+            sub[[c for c in display_cols if c in sub.columns]],
+            use_container_width=True, hide_index=True,
+        )
+        st.divider()
 
 # ============================================================
 # ⑩ 主流程
