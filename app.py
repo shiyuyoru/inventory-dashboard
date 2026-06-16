@@ -125,6 +125,58 @@ def compute_health_score(sales_90d, amount_val):
     return max(0, min(100, base))
 
 # ============================================================
+# ③-B 待处理清单决策引擎
+# ============================================================
+def compute_leader_priority(row, col_amount):
+    sales = row["90天内销量"]
+    stock = row["可用库存"]
+    amt = row[col_amount] if col_amount and col_amount in row.index else 0
+    level = row["动销等级"]
+    if level == "死库存" and amt >= 3000:
+        return "P0"
+    if sales < 30 and stock >= 500:
+        return "P0"
+    if sales < 30 and amt >= 3000:
+        return "P0"
+    if sales < 30 and stock >= 100:
+        return "P1"
+    if level == "弱动销" and amt >= 3000:
+        return "P1"
+    return "P2"
+
+def compute_leader_action(row, priority, col_amount):
+    level = row["动销等级"]
+    if priority == "P0":
+        return "立即清仓" if level == "死库存" else "降价促销"
+    elif priority == "P1":
+        return "停止补货" if level == "弱动销" else "降价促销"
+    else:
+        return "观察优化" if level == "弱动销" else "组合捆绑"
+
+def compute_leader_reason(row, priority, col_amount):
+    level = row["动销等级"]
+    sales = row["90天内销量"]
+    stock = row["可用库存"]
+    amt = row[col_amount] if col_amount and col_amount in row.index else 0
+    parts = []
+    if level == "死库存":
+        parts.append("零销量")
+    elif level == "滞销":
+        parts.append("销量极低")
+    elif level == "弱动销":
+        parts.append("动销偏弱")
+    if stock >= 500:
+        parts.append("库存较高")
+    elif stock >= 100:
+        parts.append("有一定库存积压")
+    if amt >= 3000:
+        parts.append("资金占用较高")
+    if not parts:
+        parts.append("需持续观察")
+    suffix = "，建议进入清仓评估" if priority in ("P0", "P1") else ""
+    return "、".join(parts) + suffix
+
+# ============================================================
 # ④ 数据加载（缓存）
 # ============================================================
 @st.cache_data
@@ -422,6 +474,74 @@ def build_export(prod_lw, prod_dt, sku_lw, sku_dt, col_sku, col_amount):
     return output.getvalue()
 
 # ============================================================
+# ⑨-B 领导版导出
+# ============================================================
+def build_leader_export(leader_df):
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        leader_df.to_excel(writer, sheet_name="待处理清单", index=False)
+    return output.getvalue()
+
+# ============================================================
+# ⑨-C 待处理清单渲染
+# ============================================================
+def render_leader_tab(prod_lw, prod_dt, col_amount):
+    """合并 LW+DT 低销量产品，生成领导版处理清单"""
+    p_lw = prod_lw.copy(); p_lw["品牌"] = "LW"
+    p_dt = prod_dt.copy(); p_dt["品牌"] = "DT"
+    all_prod = pd.concat([p_lw, p_dt], ignore_index=True)
+
+    low_mask = all_prod["90天内销量"] < 50
+    leader = all_prod[low_mask].copy()
+    if leader.empty:
+        st.info("当前无需处理的产品")
+        return
+
+    leader["处理优先级"] = leader.apply(lambda r: compute_leader_priority(r, col_amount), axis=1)
+    leader["建议动作"] = leader.apply(lambda r: compute_leader_action(r, r["处理优先级"], col_amount), axis=1)
+    leader["处理原因"] = leader.apply(lambda r: compute_leader_reason(r, r["处理优先级"], col_amount), axis=1)
+
+    # 排序：P0 → P1 → P2，同优先级按总价降序
+    priority_order = {"P0": 0, "P1": 1, "P2": 2}
+    leader["_sort"] = leader["处理优先级"].map(priority_order)
+    sort_col = col_amount if col_amount else "可用库存"
+    leader = leader.sort_values(["_sort", sort_col], ascending=[True, False])
+    leader = leader.drop(columns=["_sort"])
+
+    # ---- 统计卡片 ----
+    p0 = leader[leader["处理优先级"] == "P0"]
+    p1 = leader[leader["处理优先级"] == "P1"]
+    p2 = leader[leader["处理优先级"] == "P2"]
+    total_amt = leader[col_amount].sum() if col_amount else 0
+
+    c0, c1, c2, c3 = st.columns(4)
+    c0.metric("🔴 P0 必须立刻处理", len(p0))
+    c1.metric("🟠 P1 本月优先处理", len(p1))
+    c2.metric("🟡 P2 观察处理", len(p2))
+    if col_amount:
+        c3.metric("💰 待处理库存金额", f"¥{total_amt:,.0f}")
+    else:
+        c3.metric("📦 待处理库存合计", f"{leader['可用库存'].sum():,}")
+
+    # ---- 下载按钮 ----
+    excel_data = build_leader_export(leader)
+    st.download_button(
+        label="下载待处理清单 Excel",
+        data=excel_data,
+        file_name="待处理清单.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+    # ---- 表格 ----
+    display_cols = ["产品ID", "品牌", "可用库存", "90天内销量", "产品健康评分", "处理优先级", "建议动作", "处理原因"]
+    if col_amount:
+        display_cols.insert(3, col_amount)
+    st.dataframe(
+        leader[[c for c in display_cols if c in leader.columns]],
+        use_container_width=True, hide_index=True,
+    )
+
+# ============================================================
 # ⑩ 主流程
 # ============================================================
 file = st.file_uploader("上传 Excel 文件", type=["xlsx"])
@@ -452,8 +572,8 @@ if file:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-    # ---- 品牌 Tab ----
-    tab_lw, tab_dt = st.tabs(["LW", "DT"])
+    # ---- 顶层 Tab ----
+    tab_lw, tab_dt, tab_leader = st.tabs(["LW", "DT", "待处理清单"])
     for tab, brand, prod, sku in [
         (tab_lw, "LW", prod_lw, sku_lw),
         (tab_dt, "DT", prod_dt, sku_dt),
@@ -471,6 +591,9 @@ if file:
                     render_decision_panel(prod, sku, col_sku, col_amount)
                 else:
                     st.info("未识别到 SKU 列，决策面板部分功能不可用")
+    with tab_leader:
+        st.header("待处理清单")
+        render_leader_tab(prod_lw, prod_dt, col_amount)
 else:
     st.info("📂 请上传一个 Excel 文件开始分析")
     st.stop()
