@@ -185,7 +185,9 @@ def aggregate_and_enrich(df_brand, col_sku, col_amount):
     prod["清仓评分"] = prod.apply(lambda r: compute_clear_score(r["90天内销量"], r["库存金额"]), axis=1)
     prod["优先级评分"] = prod.apply(lambda r: compute_priority_score(r["库存金额"], r["90天内销量"]), axis=1)
     prod["处理建议"] = prod.apply(lambda r: compute_recommendation(r["优先级评分"], r["90天内销量"], r["产品分类"]), axis=1)
-    prod["周转率"] = prod.apply(lambda r: round(r["90天内销量"] / (r["可用库存"] + 1), 4), axis=1)
+    prod["周转率"] = prod.apply(
+        lambda r: f"{round(r['90天内销量'] / (r['可用库存'] + 1) * 100, 1)}%", axis=1
+    )
     prod["产品健康评分"] = prod.apply(lambda r: compute_health_score(r["90天内销量"], r["库存金额"], r["_is_new"]), axis=1)
     prod.drop(columns=["_is_new"], inplace=True)
 
@@ -271,7 +273,6 @@ def render_analysis(prod, sku, col_sku, col_amount, brand):
             with st.expander(f"{LEVEL_LABELS.get(lv, lv)} — {len(sub)} 个产品", expanded=False):
                 cols = ["产品ID", "可用库存", "90天内销量", "库存金额", "周转率",
                         "产品健康评分", "销售动作", "风险等级", "清仓评分", "处理建议"]
-                if col_amount: cols.insert(3, col_amount)
                 show_table(sub, cols, "90天内销量", False)
 
     st.divider()
@@ -299,7 +300,6 @@ def render_analysis(prod, sku, col_sku, col_amount, brand):
             with st.expander(f"{LEVEL_LABELS.get(lv, lv)} — {len(sub)} 个 SKU", expanded=False):
                 cols = [col_sku, "产品ID", "可用库存", "90天内销量", "库存金额",
                         "销售动作", "风险等级", "清仓评分", "处理建议"]
-                if col_amount: cols.insert(4, col_amount)
                 show_table(sub, cols, "90天内销量", False)
 
 # ============================================================
@@ -315,7 +315,6 @@ def render_new_products(prod, sku, col_sku, col_amount, has_create_time):
     if not p_new.empty:
         st.caption("定义：创建时间 ≤ 90天。新品不进入清仓/风险系统，统一标记为「新品观察」。")
         cols = ["产品ID", "可用库存", "90天内销量", "库存金额", "周转率", "销售动作", "产品健康评分"]
-        if col_amount: cols.insert(3, col_amount)
         show_table(p_new, cols, "库存金额", False)
         st.metric("新品库存金额合计", f"¥{p_new['库存金额'].sum():,.0f}")
     if sku is not None:
@@ -323,7 +322,6 @@ def render_new_products(prod, sku, col_sku, col_amount, has_create_time):
         if not s_new.empty:
             st.markdown(f"**新品 SKU：{len(s_new)} 个**")
             cols = [col_sku, "产品ID", "可用库存", "90天内销量", "库存金额", "销售动作"]
-            if col_amount: cols.insert(4, col_amount)
             show_table(s_new, cols, "库存金额", False)
 
 # ============================================================
@@ -337,7 +335,6 @@ def render_clearance(prod, sku, col_sku, col_amount):
     st.caption("按清仓评分从高到低排列，分数越高越优先处理。")
     if not p_clear.empty:
         cols = ["产品ID", "可用库存", "90天内销量", "库存金额", "周转率", "风险等级", "清仓评分", "优先级评分", "处理建议"]
-        if col_amount: cols.insert(3, col_amount)
         show_table(p_clear, cols)
         c1, c2 = st.columns(2)
         c1.metric("清仓产品库存金额", f"¥{p_clear['库存金额'].sum():,.0f}")
@@ -348,7 +345,6 @@ def render_clearance(prod, sku, col_sku, col_amount):
         if not s_clear.empty:
             st.markdown(f"**清仓 SKU：{len(s_clear)} 个**")
             cols = [col_sku, "产品ID", "可用库存", "90天内销量", "库存金额", "清仓评分", "优先级评分", "处理建议"]
-            if col_amount: cols.insert(4, col_amount)
             show_table(s_clear, cols)
 
 # ============================================================
@@ -362,7 +358,6 @@ def render_scaleup(prod, sku, col_sku, col_amount):
     st.caption("热销和主销产品，适合加广告、扩颜色/尺寸。")
     if not p_scale.empty:
         cols = ["产品ID", "可用库存", "90天内销量", "库存金额", "周转率", "产品健康评分", "销售动作", "处理建议"]
-        if col_amount: cols.insert(3, col_amount)
         show_table(p_scale, cols, "90天内销量", False)
         c1, c2 = st.columns(2)
         c1.metric("放量产品库存金额", f"¥{p_scale['库存金额'].sum():,.0f}")
@@ -373,7 +368,6 @@ def render_scaleup(prod, sku, col_sku, col_amount):
         if not s_scale.empty:
             st.markdown(f"**放量 SKU：{len(s_scale)} 个**")
             cols = [col_sku, "产品ID", "可用库存", "90天内销量", "库存金额", "销售动作"]
-            if col_amount: cols.insert(4, col_amount)
             show_table(s_scale, cols, "90天内销量", False)
 
 # ============================================================
@@ -389,7 +383,6 @@ def render_risk(prod, sku, col_sku, col_amount):
     st.markdown(f"**风险产品：{len(p_risk)} 个**")
     if not p_risk.empty:
         cols = ["产品ID", "可用库存", "90天内销量", "库存金额", "周转率", "风险等级", "产品健康评分", "处理建议"]
-        if col_amount: cols.insert(3, col_amount)
         show_table(p_risk, cols)
         # 风险统计
         for rk in ["极高风险", "高风险", "中风险"]:
@@ -401,7 +394,6 @@ def render_risk(prod, sku, col_sku, col_amount):
         if not s_risk.empty:
             st.markdown(f"**风险 SKU：{len(s_risk)} 个**")
             cols = [col_sku, "产品ID", "可用库存", "90天内销量", "库存金额", "风险等级"]
-            if col_amount: cols.insert(4, col_amount)
             show_table(s_risk, cols)
 
 # ============================================================
@@ -442,7 +434,6 @@ def render_leader(prod, sku, col_sku, col_amount):
     leader = prod.sort_values("优先级评分", ascending=False)
     cols = ["产品ID", "可用库存", "90天内销量", "库存金额", "周转率",
             "风险等级", "销售动作", "优先级评分", "处理建议"]
-    if col_amount: cols.insert(3, col_amount)
     show_table(leader, cols)
 
     # SKU 明细（折叠）
@@ -451,7 +442,6 @@ def render_leader(prod, sku, col_sku, col_amount):
         with st.expander(f"SKU 明细 — {len(sku_sorted)} 个", expanded=False):
             cols = [col_sku, "产品ID", "可用库存", "90天内销量", "库存金额",
                     "风险等级", "优先级评分", "处理建议"]
-            if col_amount: cols.insert(4, col_amount)
             show_table(sku_sorted, cols)
 
 # ============================================================
