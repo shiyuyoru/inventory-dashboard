@@ -703,7 +703,7 @@ def generate_product_combos(orders, recommended_sizes, color_scores, combo_size=
 
     for prod in recommended_sizes["产品型号"].unique():
         prod_colors = color_scores[color_scores["产品型号"] == prod]
-        top_colors = prod_colors.nlargest(12, "颜色推荐分")["色号"].tolist()
+        top_colors = prod_colors.nlargest(6, "颜色推荐分")["色号"].tolist()
 
         if len(top_colors) < 2:
             continue
@@ -844,10 +844,13 @@ def render_sea_freight_tab():
     if not recommended_sizes.empty:
         color_df = color_analysis(orders, prod_df_basic, recommended_sizes)
 
-    # ---- 生成组合 ----
+    # ---- 生成组合（仅分析前50推荐产品，避免超时） ----
     product_combos = {}
     if not color_df.empty and not recommended_sizes.empty:
-        product_combos = generate_product_combos(orders, recommended_sizes, color_df, combo_size, max_combos)
+        top50_products = prod_df_basic.head(50)["产品型号"].tolist()
+        sizes_top50 = recommended_sizes[recommended_sizes["产品型号"].isin(top50_products)]
+        colors_top50 = color_df[color_df["产品型号"].isin(top50_products)]
+        product_combos = generate_product_combos(orders, sizes_top50, colors_top50, combo_size, min(max_combos, 5))
 
     # ---- 产品级海托排行榜（含组合） ----
     prod_df = product_analysis(orders, product_combos)
