@@ -842,7 +842,7 @@ def render_sea_freight_tab():
     # ---- 颜色级分析 ----
     color_df = pd.DataFrame()
     if not recommended_sizes.empty:
-        color_df = color_analysis(orders, prod_df, recommended_sizes)
+        color_df = color_analysis(orders, prod_df_basic, recommended_sizes)
 
     # ---- 生成组合 ----
     product_combos = {}
