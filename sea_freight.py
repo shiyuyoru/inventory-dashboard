@@ -7,7 +7,7 @@ import pandas as pd
 import re
 import io
 import time
-from itertools import combinations_with_replacement
+from itertools import combinations, combinations_with_replacement
 
 # ============================================================
 # 国家识别
@@ -491,9 +491,9 @@ def build_co_purchase_table(orders):
         g = [c for c in gcols if c in orders.columns]
         if len(g) < 2: continue
         is_pkg = "_pkg" in g
-        for _, grp in orders.groupby(g[:2] if len(g) >= 2 else g):
+        for _, grp in orders.groupby(g):
             if len(grp) < 2: continue
-            colors = grp["_color"].unique()
+            colors = sorted({normalize_color(c) for c in grp["_color"].unique() if normalize_color(c)})
             prod = grp["_product"].iloc[0]
             sz = grp["_size"].iloc[0] if "_size" in grp.columns else ""
             for i in range(len(colors)):
@@ -512,35 +512,78 @@ def build_co_purchase_table(orders):
 # ============================================================
 # 组合生成
 # ============================================================
-def _score_combo(combo, color_score_map, color_cover_map, co_purchase_map, n_rec_sizes):
-    """评分单个组合，返回 (total, co_score, img_score, min_cov, unique_n)"""
+def _combo_key(combo):
+    return tuple(sorted(normalize_color(c) for c in combo if normalize_color(c)))
+
+
+def _applicable_sizes(combo, color_sizes_map):
+    size_sets = [set(color_sizes_map.get(c, set())) for c in set(combo)]
+    if not size_sets:
+        return []
+    common = set.intersection(*size_sets)
+    return sorted(common)
+
+
+def _score_combo(combo, combo_type, color_score_map, color_cover_map, color_sales_map,
+                 color_sizes_map, co_purchase_map, rec_sizes):
+    """评分单个组合，返回多维分数；共购、覆盖、结构都会进入最终排序。"""
     clist = list(combo)
+    if not clist:
+        return 0, 0, 0, 0, []
+
     color_counts = {}
+    demand_parts = []
     for c in clist:
         color_counts[c] = color_counts.get(c, 0) + 1
-    decay = {1: 1.0, 2: 0.85, 3: 0.70, 4: 0.55, 5: 0.45}
-    demand_scores = [color_score_map.get(c, 0) * decay.get(color_counts.get(c, 0), 0.5) for c in clist]
-    demand_score = sum(demand_scores) / len(demand_scores)
+        occurrence = color_counts[c]
+        repeat_decay = {1: 1.0, 2: 0.82, 3: 0.66, 4: 0.52, 5: 0.42}.get(occurrence, 0.35)
+        demand_parts.append(color_score_map.get(c, 0) * repeat_decay)
+    demand_score = sum(demand_parts) / max(len(demand_parts), 1)
 
-    co_score = 0; pair_count = 0
+    co_score = 0
+    pair_count = 0
     for i in range(len(clist)):
-        for j in range(i+1, len(clist)):
-            co_score += co_purchase_map.get((min(clist[i], clist[j]), max(clist[i], clist[j])), 0)
+        for j in range(i + 1, len(clist)):
+            if clist[i] == clist[j]:
+                continue
+            pair_score = co_purchase_map.get((min(clist[i], clist[j]), max(clist[i], clist[j])), 0)
+            co_score += pair_score
             pair_count += 1
-    co_score = min(100, (co_score / max(pair_count, 1)) * 5)
+    co_score = min(100, (co_score / max(pair_count, 1)) * 8)
 
     min_cov = min(color_cover_map.get(c, 0) for c in clist)
-    img_score = min(100, (min_cov / max(n_rec_sizes, 1)) * 100)
+    applicable = _applicable_sizes(clist, color_sizes_map)
+    shared_cov = len(applicable)
+    n_rec_sizes = max(len(rec_sizes), 1)
+    img_score = min(100, (max(shared_cov, min_cov * 0.6) / n_rec_sizes) * 100)
 
     unique_n = len(set(clist))
-    struct = {1: 10, 2: 30, 3: 50}.get(unique_n, 50)
-    struct = min(100, struct + unique_n * 5)
-    size_rep = min(100, (min_cov / max(n_rec_sizes, 1)) * 100)
-    dup_penalty = max(0, (max(color_counts.values()) / len(clist) - 0.5) * 30)
+    unique_ratio = unique_n / max(len(clist), 1)
+    structure_score = {1: 30, 2: 72}.get(unique_n, 88)
+    structure_score = min(100, structure_score + unique_ratio * 12)
 
-    total = max(0, min(100, demand_score * 0.40 + co_score * 0.25 + img_score * 0.15 + struct * 0.10 + size_rep * 0.10 - dup_penalty))
-    ctype = "爆款重复" if unique_n == 1 else ("爆款核心" if unique_n == 2 else "畅销多色")
-    return total, ctype, co_score, img_score, min_cov
+    sales_values = [color_sales_map.get(c, 0) for c in set(clist)]
+    sales_floor = min(100, (min(sales_values) / max(max(color_sales_map.values()), 1)) * 100) if sales_values else 0
+
+    type_bonus = {
+        "爆款重复": -6,
+        "爆款核心": 4,
+        "畅销多色": 8,
+        "共购组合": 10 if co_score > 0 else 0,
+    }.get(combo_type, 0)
+    repeat_penalty = max(0, (max(color_counts.values()) / len(clist) - 0.55) * 28)
+
+    total = (
+        demand_score * 0.34 +
+        co_score * 0.24 +
+        img_score * 0.16 +
+        structure_score * 0.14 +
+        sales_floor * 0.12 +
+        type_bonus -
+        repeat_penalty
+    )
+    total = max(0, min(100, total))
+    return total, co_score, img_score, shared_cov or min_cov, applicable
 
 
 def generate_product_combos(orders, recommended_sizes, color_scores,
@@ -565,19 +608,47 @@ def generate_product_combos(orders, recommended_sizes, color_scores,
         rec_sizes = prod_sizes["尺寸"].tolist()
         if not rec_sizes: continue
 
-        # 颜色池：Top 10
-        pool = prod_colors.nlargest(10, "颜色推荐分")
+        n = max(1, int(max_combos))
+
+        # 颜色池：保留有销量、有推荐分支撑的 Top 颜色，不把冷门/无销量色硬塞进组合。
+        prod_colors = prod_colors.copy()
+        prod_colors["色号"] = prod_colors["色号"].apply(normalize_color)
+        prod_colors = prod_colors[(prod_colors["总销量"] > 0) & (prod_colors["颜色推荐分"] > 0)]
+        if len(prod_colors) < 2:
+            continue
+        top_score = prod_colors["颜色推荐分"].max()
+        min_pool_score = max(25, top_score * 0.28)
+        pool = prod_colors[prod_colors["颜色推荐分"] >= min_pool_score].nlargest(12, "颜色推荐分")
+        if len(pool) < 2:
+            pool = prod_colors.nlargest(min(6, len(prod_colors)), "颜色推荐分")
+
         pool_colors = pool["色号"].tolist()
         color_score_map = dict(zip(pool["色号"], pool["颜色推荐分"]))
         color_cover_map = dict(zip(pool["色号"], pool["推荐尺寸覆盖数"]))
+        color_sales_map = dict(zip(pool["色号"], pool["总销量"]))
         top1 = pool_colors[0]
 
         co_purchase_map = {}
         if not co_purchase_df.empty:
-            cp = co_purchase_df[co_purchase_df["产品型号"] == prod]
+            cp = co_purchase_df[(co_purchase_df["产品型号"] == prod) & (co_purchase_df["尺寸"].isin(rec_sizes))]
             for _, r in cp.iterrows():
-                co_purchase_map[(r["色号A"], r["色号B"])] = r["共购分"]
-                co_purchase_map[(r["色号B"], r["色号A"])] = r["共购分"]
+                a = normalize_color(r["色号A"])
+                b = normalize_color(r["色号B"])
+                if a and b:
+                    key = (min(a, b), max(a, b))
+                    co_purchase_map[key] = co_purchase_map.get(key, 0) + r["共购分"]
+
+        prod_rec_orders = orders[
+            (orders["_product"] == prod) &
+            (orders["_size"].isin(rec_sizes)) &
+            (orders["_color"].notna()) &
+            (orders["_color"] != "")
+        ].copy()
+        prod_rec_orders["_color"] = prod_rec_orders["_color"].apply(normalize_color)
+        color_sizes_map = {
+            c: set(g["_size"].dropna().tolist())
+            for c, g in prod_rec_orders.groupby("_color")
+        }
 
         # ---- 分类型生成候选组合 ----
         repeat_candidates = []
@@ -585,122 +656,173 @@ def generate_product_combos(orders, recommended_sizes, color_scores,
         multi_candidates = []
         co_candidates = []
 
-        # 1) 纯重复组合
-        repeat_candidates.append((top1,) * combo_size)
+        def add_candidate(target, combo, ctype):
+            key = _combo_key(combo)
+            if len(key) != combo_size:
+                return
+            if any(color_sales_map.get(c, 0) <= 0 for c in key):
+                return
+            target.append({"combo": key, "type": ctype})
 
-        # 2) 爆款核心：top1 + top1 + 其他，top1 + 其他1 + 其他2
+        def extend_to_combo_size(base_colors):
+            colors = [normalize_color(c) for c in base_colors if normalize_color(c)]
+            if not colors:
+                return ()
+            fill_pool = sorted(set(colors), key=lambda c: color_score_map.get(c, 0), reverse=True)
+            while len(colors) < combo_size:
+                colors.append(fill_pool[(len(colors) - len(base_colors)) % len(fill_pool)])
+            return tuple(colors[:combo_size])
+
+        # 1) 爆款重复组合：只给最强色，且只有最强色明显领先时才生成。
+        second_score = color_score_map.get(pool_colors[1], 0) if len(pool_colors) > 1 else 0
+        if color_score_map[top1] >= 45 and (second_score <= 0 or color_score_map[top1] >= second_score * 1.05):
+            add_candidate(repeat_candidates, (top1,) * combo_size, "爆款重复")
+
+        # 2) 爆款核心：允许 top1 重复，但必须至少 2 个不同色号。
         other_colors = [c for c in pool_colors if c != top1]
-        for oc in other_colors[:5]:
-            combo = tuple(sorted([top1, top1, oc]) if combo_size == 3 else ([top1] * (combo_size - 1) + [oc]))
-            core_candidates.append(tuple(combo))
-        # top1 + 2 other different colors
-        if len(other_colors) >= 2:
-            for i in range(min(4, len(other_colors))):
-                for j in range(i+1, min(5, len(other_colors))):
-                    core_candidates.append(tuple(sorted([top1, other_colors[i], other_colors[j]])))
+        for oc in other_colors:
+            add_candidate(core_candidates, [top1] * (combo_size - 1) + [oc], "爆款核心")
+            if combo_size == 2:
+                add_candidate(core_candidates, [top1, oc], "爆款核心")
+        max_core_partners = min(len(other_colors), max(3, n + 2))
+        for r in range(2, min(combo_size, max_core_partners) + 1):
+            for partners in combinations(other_colors[:max_core_partners], r):
+                add_candidate(core_candidates, extend_to_combo_size([top1, *partners]), "爆款核心")
 
-        # 3) 畅销多色：不含 top1 的 Top 色组合
-        for i in range(min(5, len(other_colors))):
-            for j in range(i+1, min(6, len(other_colors))):
-                if combo_size == 3:
-                    multi_candidates.append(tuple(sorted([other_colors[i], other_colors[j], other_colors[min(j+1, len(other_colors)-1)]])))
-                else:
-                    combo = tuple(sorted(other_colors[i:i+combo_size]))
-                    if len(set(combo)) >= 2:
-                        multi_candidates.append(combo)
-        # 也加入一些含 top1 但颜色更丰富的
-        if len(other_colors) >= 3:
-            for i in range(min(4, len(other_colors))):
-                for j in range(i+1, min(5, len(other_colors))):
-                    multi_candidates.append(tuple(sorted([top1, other_colors[i], other_colors[j]])))
+        # 3) 畅销多色：优先生成不含 top1 的有效 Top 色组合，避免所有组合围绕一个热卖色。
+        multi_pool = other_colors[:min(len(other_colors), max(6, n + 3))]
+        for combo in combinations_with_replacement(multi_pool, combo_size):
+            if len(set(combo)) >= min(2, combo_size):
+                add_candidate(multi_candidates, combo, "畅销多色")
+        if len(other_colors) >= 2:
+            for partners in combinations(other_colors[:max_core_partners], min(2, len(other_colors[:max_core_partners]))):
+                add_candidate(multi_candidates, extend_to_combo_size([top1, *partners]), "畅销多色")
 
         # 4) 共购组合：从共购对构建
         if co_purchase_map:
             co_pairs = sorted(co_purchase_map.items(), key=lambda x: x[1], reverse=True)
-            seen_co_combos = set()
-            for (a, b), score in co_pairs[:20]:
+            for (a, b), score in co_pairs[:max(20, n * 4)]:
                 if a in pool_colors and b in pool_colors and a != b:
-                    others = [c for c in pool_colors if c not in (a, b)]
-                    if others:
-                        combo = tuple(sorted([a, b, others[0]]))
-                        if combo not in seen_co_combos:
-                            co_candidates.append(combo)
-                            seen_co_combos.add(combo)
+                    partners = sorted(
+                        [c for c in pool_colors if c not in (a, b)],
+                        key=lambda c: (
+                            co_purchase_map.get((min(a, c), max(a, c)), 0) +
+                            co_purchase_map.get((min(b, c), max(b, c)), 0),
+                            color_score_map.get(c, 0)
+                        ),
+                        reverse=True,
+                    )
+                    add_candidate(co_candidates, extend_to_combo_size([a, b, *partners[:max(combo_size - 2, 0)]]), "共购组合")
 
         # ---- 评分 ----
-        def score_list(candidates, seen):
+        def score_list(candidates):
             result = []
-            for combo in candidates:
-                ckey = tuple(sorted(normalize_color(c) for c in combo))
+            seen = set()
+            for cand in candidates:
+                combo = cand["combo"]
+                ctype = cand["type"]
+                ckey = _combo_key(combo)
                 if ckey in seen: continue
                 seen.add(ckey)
-                total, ctype, co, img, min_c = _score_combo(combo, color_score_map, color_cover_map, co_purchase_map, len(rec_sizes))
-                result.append((total, combo, ctype, co, img, min_c, ckey))
-            result.sort(key=lambda x: x[0], reverse=True)
+                total, co, img, min_c, applicable = _score_combo(
+                    combo, ctype, color_score_map, color_cover_map, color_sales_map,
+                    color_sizes_map, co_purchase_map, rec_sizes
+                )
+                result.append({
+                    "score": total,
+                    "combo_tuple": ckey,
+                    "type": ctype,
+                    "co_score": co,
+                    "img_score": img,
+                    "min_cov": min_c,
+                    "applicable_sizes": applicable,
+                    "_key": ckey,
+                    "contains_top1": top1 in ckey,
+                    "pure_repeat": len(set(ckey)) == 1,
+                })
+            result.sort(key=lambda x: x["score"], reverse=True)
             return result
 
-        seen_keys = set()
-        repeat_scored = score_list(repeat_candidates, seen_keys)
-        core_scored = score_list(core_candidates, seen_keys)
-        multi_scored = score_list(multi_candidates, seen_keys)
-        co_scored = score_list(co_candidates, seen_keys)
+        repeat_scored = sorted(score_list(repeat_candidates), key=lambda x: x["score"], reverse=True)
+        core_scored = sorted(score_list(core_candidates), key=lambda x: x["score"], reverse=True)
+        multi_scored = sorted(score_list(multi_candidates), key=lambda x: x["score"], reverse=True)
+        co_scored = sorted(score_list(co_candidates), key=lambda x: x["score"], reverse=True)
 
         # ---- 配额分配 & 填充 ----
-        n = max_combos
-        quota_repeat = min(2, max(1, n // 6))
-        remaining = n - quota_repeat
-        quota_core = max(2, remaining * 2 // 5)
-        quota_multi = max(2, remaining * 2 // 5)
-        quota_co = max(0, remaining - quota_core - quota_multi)
+        quota_repeat = 1 if repeat_scored else 0
+        quota_co = 1 if co_scored and n >= 4 else 0
+        quota_core = min(max(2 if n >= 6 else 1, int(n * 0.34)), n - quota_repeat - quota_co)
+        quota_multi = max(0, n - quota_repeat - quota_co - quota_core)
+        top1_limit = max(1, int(n * 0.70))
+        repeat_limit = 1 if n < 9 else 2
+        min_no_top1 = 2 if n >= 6 else 1
 
         selected = []
 
-        def pick(from_list, limit):
+        def can_add(item):
+            if len(selected) >= n:
+                return False
+            if any(s["_key"] == item["_key"] for s in selected):
+                return False
+            if item["pure_repeat"] and sum(1 for s in selected if s["pure_repeat"]) >= repeat_limit:
+                return False
+            if item["contains_top1"] and sum(1 for s in selected if s["contains_top1"]) >= top1_limit:
+                return False
+            return True
+
+        def add_item(item):
+            if can_add(item):
+                selected.append(item)
+                return True
+            return False
+
+        def pick(from_list, limit, require_no_top1=False):
+            picked = 0
             for item in from_list:
-                if len([s for s in selected if s["_key"] == item[6]]) > 0: continue
-                if len([s for s in selected if s["type"] == item[2]]) >= limit and item[2] != "畅销多色":
+                if picked >= limit:
+                    break
+                if require_no_top1 and item["contains_top1"]:
                     continue
-                selected.append({
-                    "_key": item[6], "combo_tuple": item[1], "score": item[0],
-                    "type": item[2], "co_score": item[3], "img_score": item[4], "min_cov": item[5],
-                })
+                if add_item(item):
+                    picked += 1
 
         pick(repeat_scored, quota_repeat)
         pick(co_scored, quota_co)
         pick(core_scored, quota_core)
-        pick(multi_scored, quota_multi)
+        pick(multi_scored, min(quota_multi, min_no_top1), require_no_top1=True)
+        pick(multi_scored, quota_multi - min(quota_multi, min_no_top1))
 
-        # 如果还不够，用 multi 填充
+        # 如果还不够，用所有高分候选补齐，但仍遵守 Top1 占比、重复组合等约束。
         if len(selected) < n:
-            for item in multi_scored + core_scored:
-                if len(selected) >= n: break
-                if any(c["_key"] == item[6] for c in selected): continue
-                selected.append({
-                    "_key": item[6], "combo_tuple": item[1], "score": item[0],
-                    "type": item[2], "co_score": item[3], "img_score": item[4], "min_cov": item[5],
-                })
-
-        selected = selected[:n]
+            combined = sorted(multi_scored + co_scored + core_scored + repeat_scored, key=lambda x: x["score"], reverse=True)
+            for item in combined:
+                if len(selected) >= n:
+                    break
+                add_item(item)
 
         # ---- 输出 ----
         previews = []
         for s in selected:
             formatted = format_combo(s["combo_tuple"])
             previews.append(formatted)
+            applicable_sizes = s["applicable_sizes"] or rec_sizes[:1]
+            display_type = s["type"]
+            if len(rec_sizes) > 1 and len(applicable_sizes) <= 1:
+                display_type = "单尺寸特化"
             all_combo_rows.append({
                 "产品型号": prod,
                 "推荐尺寸": " / ".join(rec_sizes),
-                "组合类型": s["type"],
+                "组合类型": display_type,
                 "推荐组合色号": formatted,
                 "组合件数": combo_size,
-                "是否共用图片": "是" if s["min_cov"] >= len(rec_sizes) else ("有限" if s["min_cov"] >= 2 else "否"),
-                "适用尺寸": " / ".join(rec_sizes) if s["min_cov"] >= len(rec_sizes) else rec_sizes[0],
+                "是否共用图片": "是" if len(applicable_sizes) >= len(rec_sizes) else ("有限" if len(applicable_sizes) >= 2 else "否"),
+                "适用尺寸": " / ".join(applicable_sizes),
                 "组合推荐分": round(s["score"], 1),
-                "推荐理由": f"{s['type']}组合，均分{s['score']:.0f}" if s["score"] >= 50 else "可参考",
-                "注意事项": "" if s["min_cov"] >= 2 else "单尺寸特化，不建议做共用图片",
+                "推荐理由": f"{display_type}；颜色销量/共购/推荐尺寸覆盖综合评分 {s['score']:.0f}",
+                "注意事项": "" if len(applicable_sizes) >= 2 or len(rec_sizes) == 1 else "单尺寸特化，不建议做共用图片",
             })
 
-        product_combos_preview[prod] = " | ".join(previews[:5])
+        product_combos_preview[prod] = " | ".join(previews[:max_combos])
 
     combo_df = pd.DataFrame(all_combo_rows).sort_values(["产品型号", "组合推荐分"], ascending=[True, False]) if all_combo_rows else pd.DataFrame()
     return product_combos_preview, combo_df
@@ -776,15 +898,12 @@ def render_sea_freight_tab():
         # 共购表
         co_purchase_df = build_co_purchase_table(orders) if not orders.empty else pd.DataFrame()
 
-        # 组合（仅前50产品）
+        # 组合（所有推荐产品）
         product_combos = {}
         combo_df = pd.DataFrame()
         if not color_df.empty and not recommended_sizes.empty:
-            top50 = prod_df_basic.head(50)["产品型号"].tolist()
-            sizes_50 = recommended_sizes[recommended_sizes["产品型号"].isin(top50)]
-            colors_50 = color_df[color_df["产品型号"].isin(top50)]
             product_combos, combo_df = generate_product_combos(
-                orders, sizes_50, colors_50, combo_size, max_combos, co_purchase_df
+                orders, recommended_sizes, color_df, combo_size, max_combos, co_purchase_df
             )
 
         # 产品排行榜（含组合预览）
