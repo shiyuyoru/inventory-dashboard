@@ -765,9 +765,22 @@ def render_sea_freight_tab():
             start_date = pd.Timestamp("2020-01-01")
             end_date = pd.Timestamp.now()
 
-    # 数据处理
+    # 数据处理（含诊断）
     min_dt = pd.Timestamp(start_date)
     max_dt = pd.Timestamp(end_date)
+
+    diag = []
+    diag.append(f"原始行数: {len(df):,}")
+    raw = df.copy()
+    if "_time" in raw.columns:
+        diag.append(f"时间列有效值: {raw['_time'].notna().sum():,} / {len(raw):,}")
+    if country_col:
+        diag.append(f"法国: {raw['_is_fr'].sum():,}  意大利: {raw['_is_it'].sum():,}")
+    if store_col:
+        d1 = raw[store_col].astype(str).str.upper().str.startswith("D1").sum()
+        diag.append(f"D1店铺: {d1:,}  非D1: {len(raw) - d1:,}")
+    diag.append(f"时间筛选范围: {start_date} ~ {end_date}")
+
     orders = prepare_orders(df, sku_col, qty_col, refund_col, country_col, name_col,
                             store_col, spec_col, merch_sku_col,
                             fr_only, it_only, min_dt, max_dt)
@@ -778,7 +791,15 @@ def render_sea_freight_tab():
 
     # 品牌过滤
     if brand_filter:
+        before = len(orders)
         orders = orders[orders["_brand"].isin(brand_filter)]
+        if len(orders) != before:
+            diag.append(f"品牌过滤: {before:,} → {len(orders):,}")
+
+    diag.append(f"最终有效: {len(orders):,} 行, {orders['_product'].nunique()} 个产品")
+    with st.expander("诊断信息", expanded=True):
+        for d in diag:
+            st.caption(d)
 
     st.success(f"有效订单行数：{len(orders):,} | 产品数：{orders['_product'].nunique()}")
 
