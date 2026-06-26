@@ -475,8 +475,9 @@ def build_full_export(prod_all, sku_all, col_sku, col_amount):
 # ============================================================
 # ⑭ 主流程
 # ============================================================
-file = st.file_uploader("上传 Excel 文件", type=["xlsx"])
+file = st.file_uploader("上传库存 Excel 文件", type=["xlsx"], key="inventory_upload")
 
+inventory_ready = False
 if file:
     df, col_sku, col_amount, col_price, col_create, filtered = load_data(file.getvalue())
     if filtered:
@@ -518,32 +519,50 @@ if file:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-    # ---- 6 个顶层 Tab ----
-    t1, t2, t3, t4, t5, t6, t7 = st.tabs([
-        "📊 库存分析", "🆕 新品池", "🗑️ 清仓清单",
-        "📈 放量清单", "⚠️ 风险清单", "💰 领导决策清单",
-        "🚢 法国/意大利海托分析",
-    ])
+    # 存入 session_state 供 tabs 使用
+    st.session_state["_inv_prod_lw"] = prod_lw
+    st.session_state["_inv_prod_dt"] = prod_dt
+    st.session_state["_inv_prod_all"] = prod_all
+    st.session_state["_inv_sku_lw"] = sku_lw
+    st.session_state["_inv_sku_dt"] = sku_dt
+    st.session_state["_inv_sku_all"] = sku_all
+    st.session_state["_inv_col_sku"] = col_sku
+    st.session_state["_inv_col_amount"] = col_amount
+    st.session_state["_inv_col_create"] = bool(col_create)
+    inventory_ready = True
 
-    with t1:
+# ---- 7 个顶层 Tab（始终显示） ----
+t1, t2, t3, t4, t5, t6, t7 = st.tabs([
+    "📊 库存分析", "🆕 新品池", "🗑️ 清仓清单",
+    "📈 放量清单", "⚠️ 风险清单", "💰 领导决策清单",
+    "🚢 法国/意大利海托分析",
+])
+
+_inv = lambda k: st.session_state.get(k)
+
+with t1:
+    if not inventory_ready:
+        st.info("📂 请先在上方上传库存 Excel 文件")
+    else:
         sub_lw, sub_dt = st.tabs(["LW", "DT"])
         with sub_lw:
-            render_analysis(prod_lw, sku_lw, col_sku, col_amount, "LW")
+            render_analysis(_inv("_inv_prod_lw"), _inv("_inv_sku_lw"), _inv("_inv_col_sku"), _inv("_inv_col_amount"), "LW")
         with sub_dt:
-            render_analysis(prod_dt, sku_dt, col_sku, col_amount, "DT")
-    with t2:
-        render_new_products(prod_all, sku_all, col_sku, col_amount, bool(col_create))
-    with t3:
-        render_clearance(prod_all, sku_all, col_sku, col_amount)
-    with t4:
-        render_scaleup(prod_all, sku_all, col_sku, col_amount)
-    with t5:
-        render_risk(prod_all, sku_all, col_sku, col_amount)
-    with t6:
-        render_leader(prod_all, sku_all, col_sku, col_amount)
-    with t7:
-        render_sea_freight_tab()
-
-else:
-    st.info("📂 请上传一个 Excel 文件开始分析")
-    st.stop()
+            render_analysis(_inv("_inv_prod_dt"), _inv("_inv_sku_dt"), _inv("_inv_col_sku"), _inv("_inv_col_amount"), "DT")
+with t2:
+    if not inventory_ready: st.info("📂 请先在上方上传库存 Excel 文件")
+    else: render_new_products(_inv("_inv_prod_all"), _inv("_inv_sku_all"), _inv("_inv_col_sku"), _inv("_inv_col_amount"), _inv("_inv_col_create"))
+with t3:
+    if not inventory_ready: st.info("📂 请先在上方上传库存 Excel 文件")
+    else: render_clearance(_inv("_inv_prod_all"), _inv("_inv_sku_all"), _inv("_inv_col_sku"), _inv("_inv_col_amount"))
+with t4:
+    if not inventory_ready: st.info("📂 请先在上方上传库存 Excel 文件")
+    else: render_scaleup(_inv("_inv_prod_all"), _inv("_inv_sku_all"), _inv("_inv_col_sku"), _inv("_inv_col_amount"))
+with t5:
+    if not inventory_ready: st.info("📂 请先在上方上传库存 Excel 文件")
+    else: render_risk(_inv("_inv_prod_all"), _inv("_inv_sku_all"), _inv("_inv_col_sku"), _inv("_inv_col_amount"))
+with t6:
+    if not inventory_ready: st.info("📂 请先在上方上传库存 Excel 文件")
+    else: render_leader(_inv("_inv_prod_all"), _inv("_inv_sku_all"), _inv("_inv_col_sku"), _inv("_inv_col_amount"))
+with t7:
+    render_sea_freight_tab()
