@@ -1,0 +1,726 @@
+"""
+法国/意大利海托组合分析模块
+数据源：店小秘订单导出表（非库存表）
+"""
+import streamlit as st
+import pandas as pd
+import re
+import io
+from itertools import combinations_with_replacement, combinations
+
+# ============================================================
+# 国家识别
+# ============================================================
+FR_KEYS = ["法国", "france", "fr"]
+IT_KEYS = ["意大利", "italy", "it"]
+
+
+def is_france(val):
+    v = str(val).strip().lower()
+    return any(k in v for k in FR_KEYS)
+
+
+def is_italy(val):
+    v = str(val).strip().lower()
+    return any(k in v for k in IT_KEYS)
+
+
+# ============================================================
+# 产品/尺寸/颜色识别
+# ============================================================
+def extract_product(text):
+    """从任意文本中提取 LW/DT 产品型号"""
+    if pd.isna(text):
+        return None
+    m = re.search(r"\b(LW\d{3,4}|DT\d{3,5})\b", str(text).strip())
+    return m.group(1) if m else None
+
+
+def extract_size(text):
+    """从 SKU/产品规格中提取尺寸 mm"""
+    if pd.isna(text):
+        return None
+    s = str(text).strip()
+    m = re.search(r"(\d{2,3})\s*mm", s, re.IGNORECASE)
+    if m:
+        return f"{m.group(1)}mm"
+    return None
+
+
+def extract_color(text):
+    """从 SKU 尾部提取色号，如 003, 019"""
+    if pd.isna(text):
+        return None
+    s = str(text).strip()
+    # 尝试从末尾提取 3 位数字色号
+    m = re.search(r"(\d{3,4})$", s)
+    if m:
+        code = m.group(1)
+        if len(code) == 3:
+            return code
+        if len(code) == 4:
+            # 尝试清洗为标准 3 位色号
+            return code[:3]
+    return None
+
+
+# ============================================================
+# 数据加载
+# ============================================================
+@st.cache_data
+def load_orders(file_bytes):
+    df = pd.read_excel(io.BytesIO(file_bytes))
+    # 列名标准化
+    df.columns = df.columns.astype(str).str.strip()
+
+    # 时间列
+    time_col = None
+    for c in df.columns:
+        if "付款时间" in c:
+            time_col = c
+            break
+    if not time_col:
+        for c in df.columns:
+            if "下单时间" in c:
+                time_col = c
+                break
+    if time_col:
+        df["_time"] = pd.to_datetime(df[time_col], errors="coerce")
+
+    # 国家列
+    country_col = None
+    for c in df.columns:
+        if "收货人国家" in c:
+            country_col = c
+            break
+    if country_col:
+        df["_is_fr"] = df[country_col].apply(is_france)
+        df["_is_it"] = df[country_col].apply(is_italy)
+    else:
+        df["_is_fr"] = False
+        df["_is_it"] = False
+
+    # SKU 列
+    sku_col = None
+    for c in df.columns:
+        if c.strip() == "SKU":
+            sku_col = c
+            break
+    if not sku_col:
+        for c in df.columns:
+            if "商品SKU" in c or "商品编码" in c:
+                sku_col = c
+                break
+    if not sku_col:
+        sku_col = "SKU"
+        df[sku_col] = ""
+
+    # 数量列
+    qty_col = None
+    for c in df.columns:
+        if "单个产品数量" in c:
+            qty_col = c
+            break
+
+    # 退款列
+    refund_col = None
+    for c in df.columns:
+        if "退款金额" in c:
+            refund_col = c
+            break
+    if refund_col:
+        df[refund_col] = pd.to_numeric(df[refund_col], errors="coerce").fillna(0)
+
+    # 产品名称
+    name_col = None
+    for c in df.columns:
+        if "产品名称" in c:
+            name_col = c
+            break
+
+    return df, sku_col, qty_col, refund_col, country_col, time_col, name_col
+
+
+# ============================================================
+# 筛选 + 识别
+# ============================================================
+def prepare_orders(df, sku_col, qty_col, refund_col, country_col, name_col, fr_only, it_only, min_date, max_date):
+    """筛选法意订单，识别产品、尺寸、颜色"""
+    orders = df.copy()
+
+    # 时间筛选
+    if "_time" in orders.columns:
+        orders = orders[(orders["_time"] >= min_date) & (orders["_time"] <= max_date)]
+
+    # 国家筛选
+    if fr_only and it_only:
+        orders = orders[orders["_is_fr"] | orders["_is_it"]]
+    elif fr_only:
+        orders = orders[orders["_is_fr"]]
+    elif it_only:
+        orders = orders[orders["_is_it"]]
+
+    if orders.empty:
+        return orders
+
+    # 产品识别
+    orders["_product"] = orders[sku_col].apply(extract_product)
+    if name_col and orders["_product"].isna().any():
+        fallback = orders[name_col].apply(extract_product)
+        orders["_product"] = orders["_product"].fillna(fallback)
+
+    orders = orders[orders["_product"].notnull()].copy()
+
+    # 品牌
+    orders["_brand"] = orders["_product"].apply(lambda x: x[:2])
+
+    # 尺寸识别
+    orders["_size"] = orders[sku_col].apply(extract_size)
+
+    # 颜色识别
+    orders["_color"] = orders[sku_col].apply(extract_color)
+
+    # 数量
+    if qty_col:
+        orders["_qty"] = pd.to_numeric(orders[qty_col], errors="coerce").fillna(1)
+    else:
+        orders["_qty"] = 1
+
+    # 退款标记
+    if refund_col:
+        orders["_has_refund"] = orders[refund_col] > 0
+    else:
+        orders["_has_refund"] = False
+
+    # 订单号
+    order_col = None
+    for c in df.columns:
+        if "订单号" in c and "包裹号" not in c:
+            order_col = c
+            break
+    if order_col:
+        orders["_order"] = orders[order_col].astype(str)
+
+    # 包裹号
+    pkg_col = None
+    for c in df.columns:
+        if "包裹号" in c:
+            pkg_col = c
+            break
+    if pkg_col:
+        orders["_pkg"] = orders[pkg_col].astype(str)
+
+    return orders
+
+
+# ============================================================
+# 产品级分析
+# ============================================================
+def product_analysis(orders):
+    """产品级海托适合度分析"""
+    if orders.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for prod, grp in orders.groupby("_product"):
+        fr_sales = grp[grp["_is_fr"]]["_qty"].sum()
+        it_sales = grp[grp["_is_it"]]["_qty"].sum()
+        total_sales = fr_sales + it_sales
+        fr_orders = grp[grp["_is_fr"]]["_order"].nunique() if "_order" in grp.columns else 0
+        it_orders = grp[grp["_is_it"]]["_order"].nunique() if "_order" in grp.columns else 0
+        total_orders = fr_orders + it_orders
+        n_sizes = grp["_size"].dropna().nunique()
+        n_colors = grp["_color"].dropna().nunique()
+        refund_rate = grp["_has_refund"].mean() if "_has_refund" in grp.columns else 0
+        n_pkgs = grp["_pkg"].nunique() if "_pkg" in grp.columns else 0
+
+        # 月份覆盖
+        month_cover = 0
+        if "_time" in grp.columns:
+            month_cover = grp["_time"].dt.to_period("M").nunique()
+
+        # 推荐等级
+        if total_sales >= 100 and n_sizes >= 2 and refund_rate < 0.15:
+            level = "强烈推荐"
+        elif total_sales >= 50:
+            level = "推荐"
+        elif total_sales >= 20:
+            level = "可测试"
+        else:
+            level = "暂不推荐"
+
+        reason = []
+        if total_sales >= 100:
+            reason.append("法意销量充足")
+        if n_sizes >= 2:
+            reason.append("多尺寸可组合")
+        if refund_rate < 0.10:
+            reason.append("退款风险低")
+
+        rows.append({
+            "产品型号": prod,
+            "品牌": prod[:2],
+            "法国销量": int(fr_sales),
+            "意大利销量": int(it_sales),
+            "总销量": int(total_sales),
+            "法国订单数": int(fr_orders),
+            "意大利订单数": int(it_orders),
+            "总订单数": int(total_orders),
+            "包裹数": int(n_pkgs),
+            "有销量尺寸数": n_sizes,
+            "有销量色号数": n_colors,
+            "月份覆盖数": month_cover,
+            "退款风险": f"{refund_rate:.1%}",
+            "海托推荐等级": level,
+            "推荐理由": "、".join(reason) if reason else "需进一步评估",
+        })
+
+    df = pd.DataFrame(rows).sort_values("总销量", ascending=False)
+    return df
+
+
+# ============================================================
+# 尺寸级分析
+# ============================================================
+def size_analysis(orders, min_total_sales=20):
+    """按产品+尺寸聚合，计算尺寸推荐分"""
+    if orders.empty:
+        return pd.DataFrame()
+
+    prod_sizes = orders.groupby(["_product", "_size"]).agg(
+        FR_sales=("_is_fr", lambda x: orders.loc[x.index, "_qty"][x].sum()),
+        IT_sales=("_is_it", lambda x: orders.loc[x.index, "_qty"][x].sum()),
+        total_qty=("_qty", "sum"),
+        n_orders=("_order", "nunique") if "_order" in orders.columns else ("_qty", "sum"),
+        n_colors=("_color", lambda x: x.dropna().nunique()),
+        has_fr=("_is_fr", "any"),
+        has_it=("_is_it", "any"),
+        refund_rate=("_has_refund", "mean") if "_has_refund" in orders.columns else ("_qty", lambda x: 0),
+    ).reset_index()
+
+    if prod_sizes.empty:
+        return pd.DataFrame()
+
+    prod_sizes.columns = ["_product", "_size", "FR_sales", "IT_sales", "total_qty",
+                           "n_orders", "n_colors", "has_fr", "has_it", "refund_rate"]
+    prod_sizes["FR_sales"] = prod_sizes["FR_sales"].fillna(0).astype(int)
+    prod_sizes["IT_sales"] = prod_sizes["IT_sales"].fillna(0).astype(int)
+    prod_sizes["has_fr"] = prod_sizes["has_fr"].fillna(False)
+    prod_sizes["has_it"] = prod_sizes["has_it"].fillna(False)
+
+    # 过滤无尺寸的
+    prod_sizes = prod_sizes[prod_sizes["_size"].notna() & (prod_sizes["_size"] != "")]
+
+    if prod_sizes.empty:
+        return pd.DataFrame()
+
+    # 月覆盖
+    if "_time" in orders.columns:
+        month_cover = orders.groupby(["_product", "_size"])["_time"].apply(
+            lambda x: x.dt.to_period("M").nunique()
+        ).reset_index()
+        month_cover.columns = ["_product", "_size", "month_cover"]
+        prod_sizes = prod_sizes.merge(month_cover, on=["_product", "_size"], how="left")
+        prod_sizes["month_cover"] = prod_sizes["month_cover"].fillna(0).astype(int)
+    else:
+        prod_sizes["month_cover"] = 0
+
+    # 为每个产品内部计算尺寸推荐分
+    results = []
+    for prod, grp in prod_sizes.groupby("_product"):
+        if grp["total_qty"].sum() < min_total_sales:
+            continue
+        grp = grp.copy()
+        total_prod_qty = grp["total_qty"].sum()
+
+        # A. 尺寸销量占比 35%
+        grp["size_share"] = grp["total_qty"] / max(total_prod_qty, 1)
+        max_share = grp["size_share"].max()
+        grp["score_share"] = (grp["size_share"] / max(max_share, 0.01)) * 35
+
+        # B. 法意加权 25%
+        grp["weighted_sales"] = grp["FR_sales"] * 1.2 + grp["IT_sales"] * 1.0
+        max_w = grp["weighted_sales"].max()
+        grp["score_weighted"] = (grp["weighted_sales"] / max(max_w, 1)) * 25
+
+        # C. 订单数 15%
+        max_ord = grp["n_orders"].max()
+        grp["score_orders"] = (grp["n_orders"] / max(max_ord, 1)) * 15
+
+        # D. 色号活跃度 10%
+        max_col = grp["n_colors"].max()
+        grp["score_color_active"] = (grp["n_colors"] / max(max_col, 1)) * 10
+
+        # E. 国家覆盖 10%
+        grp["score_country"] = grp.apply(
+            lambda r: 10 if r["has_fr"] and r["has_it"] else (7 if r["has_fr"] else (5 if r["has_it"] else 2)),
+            axis=1,
+        )
+
+        # F. 月份覆盖 5%
+        max_mo = grp["month_cover"].max()
+        grp["score_month"] = (grp["month_cover"] / max(max_mo, 1)) * 5
+
+        # G. 退款惩罚
+        grp["penalty_refund"] = grp["refund_rate"].apply(
+            lambda r: 0 if r < 0.05 else (5 if r < 0.15 else (10 if r < 0.30 else 20))
+        )
+
+        grp["尺寸推荐分"] = (
+            grp["score_share"] + grp["score_weighted"] + grp["score_orders"] +
+            grp["score_color_active"] + grp["score_country"] + grp["score_month"] -
+            grp["penalty_refund"]
+        ).clip(0, 100).round(1)
+
+        # 推荐状态
+        grp = grp.sort_values("尺寸推荐分", ascending=False)
+        top_scores = grp["尺寸推荐分"].values
+        max_score = top_scores[0] if len(top_scores) > 0 else 0
+
+        def status(rank, score):
+            if rank == 0:
+                return "主推尺寸"
+            elif rank == 1 and (score >= 60 or score >= max_score * 0.5):
+                return "次推尺寸"
+            elif rank == 2 and (score >= 60 or score >= max_score * 0.5):
+                return "第三尺寸"
+            elif score >= 50:
+                return "备选尺寸"
+            return "不建议"
+
+        grp["推荐状态"] = [status(i, s) for i, s in enumerate(grp["尺寸推荐分"])]
+        grp["不推荐原因"] = grp["推荐状态"].apply(
+            lambda x: "" if x != "不建议" else "得分不足或销量占比偏低"
+        )
+
+        # 国家覆盖描述
+        grp["国家覆盖"] = grp.apply(
+            lambda r: "法国+意大利" if r["has_fr"] and r["has_it"] else ("法国主导" if r["has_fr"] else "意大利"),
+            axis=1,
+        )
+
+        results.append(grp)
+
+    if not results:
+        return pd.DataFrame()
+
+    final = pd.concat(results, ignore_index=True)
+    final = final.rename(columns={
+        "_product": "产品型号", "_size": "尺寸",
+        "FR_sales": "法国销量", "IT_sales": "意大利销量",
+        "total_qty": "总销量", "n_orders": "订单数",
+        "n_colors": "有销量色号数", "month_cover": "月份覆盖数",
+    })
+    display_cols = ["产品型号", "尺寸", "法国销量", "意大利销量", "总销量",
+                    "订单数", "销量占比", "有销量色号数", "国家覆盖",
+                    "月份覆盖数", "尺寸推荐分", "推荐状态", "不推荐原因"]
+    final["销量占比"] = (final["总销量"] / final.groupby("产品型号")["总销量"].transform("sum") * 100).round(1).astype(str) + "%"
+    return final[display_cols].sort_values(["产品型号", "尺寸推荐分"], ascending=[True, False])
+
+
+# ============================================================
+# 颜色级分析
+# ============================================================
+def color_analysis(orders, recommended_products, recommended_sizes):
+    """跨推荐尺寸的颜色表现分析"""
+    if orders.empty:
+        return pd.DataFrame()
+
+    orders = orders[orders["_color"].notna() & (orders["_color"] != "")]
+    if orders.empty:
+        return pd.DataFrame()
+
+    key = orders[["_product", "_size", "_color", "_qty", "_is_fr", "_is_it",
+                   "_has_refund", "_order", "_pkg"]].copy()
+
+    # 只分析推荐产品+推荐尺寸
+    rec_set = set()
+    for _, row in recommended_sizes.iterrows():
+        rec_set.add((row["产品型号"], row["尺寸"]))
+
+    if rec_set:
+        key["_rec"] = key.apply(lambda r: (r["_product"], r["_size"]) in rec_set, axis=1)
+        key = key[key["_rec"]]
+
+    # 颜色聚合
+    color_agg = key.groupby(["_product", "_color"]).agg(
+        FR_sales=("_qty", lambda x: key.loc[x.index][key.loc[x.index, "_is_fr"]]["_qty"].sum()),
+        IT_sales=("_qty", lambda x: key.loc[x.index][key.loc[x.index, "_is_it"]]["_qty"].sum()),
+        total_qty=("_qty", "sum"),
+        n_orders=("_order", "nunique") if "_order" in key.columns else ("_qty", "sum"),
+        n_sizes_covered=("_size", "nunique"),
+        refund_rate=("_has_refund", "mean") if "_has_refund" in key.columns else ("_qty", lambda x: 0),
+    ).reset_index()
+
+    color_agg.columns = ["_product", "_color", "FR_sales", "IT_sales", "total_qty",
+                          "n_orders", "n_sizes_covered", "refund_rate"]
+    color_agg["FR_sales"] = color_agg["FR_sales"].fillna(0).astype(int)
+    color_agg["IT_sales"] = color_agg["IT_sales"].fillna(0).astype(int)
+
+    # 颜色推荐分计算（简化版：加权销量 45% + 尺寸覆盖 20% + 订单 15% + 退款惩罚）
+    results = []
+    for prod, grp in color_agg.groupby("_product"):
+        grp = grp.copy()
+        grp["weighted"] = grp["FR_sales"] * 1.2 + grp["IT_sales"] * 1.0
+        max_w = grp["weighted"].max()
+        grp["score_sales"] = (grp["weighted"] / max(max_w, 1)) * 45
+
+        max_cov = grp["n_sizes_covered"].max()
+        grp["score_cover"] = (grp["n_sizes_covered"] / max(max_cov, 1)) * 20
+
+        max_ord = grp["n_orders"].max()
+        grp["score_orders"] = (grp["n_orders"] / max(max_ord, 1)) * 15
+
+        grp["penalty"] = grp["refund_rate"].apply(
+            lambda r: 0 if r < 0.05 else (5 if r < 0.15 else (10 if r < 0.30 else 20))
+        )
+
+        grp["颜色推荐分"] = (
+            grp["score_sales"] + grp["score_cover"] + grp["score_orders"] - grp["penalty"]
+        ).clip(0, 100).round(1)
+
+        grp["共用图片"] = grp["n_sizes_covered"].apply(
+            lambda n: "适合" if n >= 3 else ("有限" if n >= 2 else "单尺寸特化")
+        )
+
+        results.append(grp)
+
+    if not results:
+        return pd.DataFrame()
+
+    final = pd.concat(results, ignore_index=True)
+    final = final.rename(columns={"_product": "产品型号", "_color": "色号",
+                                    "FR_sales": "法国销量", "IT_sales": "意大利销量",
+                                    "total_qty": "总销量", "n_orders": "订单数",
+                                    "n_sizes_covered": "推荐尺寸覆盖数"})
+    cols = ["产品型号", "色号", "法国销量", "意大利销量", "总销量", "订单数",
+            "推荐尺寸覆盖数", "颜色推荐分", "共用图片"]
+    return final[cols].sort_values(["产品型号", "颜色推荐分"], ascending=[True, False])
+
+
+# ============================================================
+# 组合生成
+# ============================================================
+def generate_combos(orders, recommended_sizes, color_scores, combo_size=3, max_combos=10):
+    """为每个推荐产品生成 SKU 组合建议"""
+    if orders.empty or recommended_sizes.empty or color_scores.empty:
+        return pd.DataFrame()
+
+    all_combos = []
+
+    for prod in recommended_sizes["产品型号"].unique():
+        # 该产品的推荐尺寸
+        prod_sizes = recommended_sizes[
+            (recommended_sizes["产品型号"] == prod) &
+            (recommended_sizes["推荐状态"] != "不建议")
+            ]
+        if prod_sizes.empty:
+            continue
+
+        rec_size_list = prod_sizes["尺寸"].tolist()
+
+        # 该产品颜色池 top-colors
+        prod_colors = color_scores[color_scores["产品型号"] == prod]
+        top_colors = prod_colors.nlargest(8, "颜色推荐分")["色号"].tolist()
+
+        if len(top_colors) < 2:
+            continue
+
+        # 生成组合（有放回）
+        combos = list(combinations_with_replacement(top_colors, combo_size))
+
+        # 为每个组合计算得分
+        combo_scored = []
+        for combo in combos:
+            color_list = list(combo)
+            scores = []
+            covers = []
+            for c in color_list:
+                row = prod_colors[prod_colors["色号"] == c]
+                if not row.empty:
+                    scores.append(row["颜色推荐分"].values[0])
+                    covers.append(row["推荐尺寸覆盖数"].values[0])
+
+            if not scores:
+                continue
+
+            avg_score = sum(scores) / len(scores)
+            # 衰减重复色权重
+            unique_colors = set(color_list)
+            diversity_bonus = len(unique_colors) / len(color_list) * 5
+
+            # 共用图片分
+            min_cover = min(covers) if covers else 0
+            shared_image_score = min_cover / max(len(rec_size_list), 1) * 20
+
+            combo_score = avg_score * 0.7 + shared_image_score + diversity_bonus
+            combo_score = min(100, combo_score)
+
+            # 组合类型
+            if len(unique_colors) == 1:
+                ctype = "爆款重复"
+            elif len(unique_colors) <= 2:
+                ctype = "爆款核心"
+            else:
+                ctype = "畅销多色"
+
+            combo_scored.append((combo_score, combo, ctype, shared_image_score))
+
+        combo_scored.sort(key=lambda x: x[0], reverse=True)
+
+        # 确保多样性：至少各类型有代表
+        selected = []
+        types_seen = set()
+        for cs in combo_scored:
+            if len(selected) >= max_combos:
+                break
+            if cs[2] not in types_seen and len(selected) < max_combos - 3:
+                selected.append(cs)
+                types_seen.add(cs[2])
+            elif cs[2] in types_seen:
+                selected.append(cs)
+
+        for score, combo, ctype, shared in selected[:max_combos]:
+            color_str = "".join(combo)
+            applicable = "、".join(rec_size_list) if shared > 10 else rec_size_list[0]
+
+            all_combos.append({
+                "产品型号": prod,
+                "推荐尺寸": " / ".join(rec_size_list),
+                "组合类型": ctype,
+                "推荐组合": color_str,
+                "组合件数": combo_size,
+                "共用图片": "是" if shared > 10 else "否",
+                "适用尺寸": applicable,
+                "组合推荐分": round(score, 1),
+                "推荐理由": f"{ctype}组合，均分{round(score,0)}" if score >= 50 else "可参考",
+            })
+
+    if not all_combos:
+        return pd.DataFrame()
+    return pd.DataFrame(all_combos).sort_values("组合推荐分", ascending=False)
+
+
+# ============================================================
+# 渲染函数
+# ============================================================
+def render_sea_freight_tab():
+    st.header("法国/意大利海托组合分析")
+
+    st.markdown("""
+    **数据源：店小秘订单导出表**（非库存表）
+    分析法国和意大利近一年订单，筛选适合法国仓海托的产品、尺寸和 SKU 组合。
+    """)
+
+    # 上传订单 Excel
+    order_file = st.file_uploader("上传订单导出 Excel", type=["xlsx"], key="sea_freight_upload")
+    if not order_file:
+        st.info("请上传店小秘订单导出表开始分析。")
+        return
+
+    df, sku_col, qty_col, refund_col, country_col, time_col, name_col = load_orders(order_file.getvalue())
+
+    if df.empty:
+        st.error("订单表为空或无法读取。")
+        return
+
+    # ---- 侧边筛选 ----
+    with st.sidebar:
+        st.markdown("### 海托筛选条件")
+        fr_only = st.checkbox("法国", value=True)
+        it_only = st.checkbox("意大利", value=True)
+        brand_filter = st.multiselect("品牌", ["LW", "DT"], default=["LW", "DT"])
+        min_sales = st.number_input("最低总销量阈值", 1, 1000, 20)
+        combo_size = st.selectbox("组合件数", [2, 3, 4, 5], index=2)
+        max_combos = st.slider("每产品最大组合数", 6, 20, 10)
+
+        # 时间范围
+        if "_time" in df.columns:
+            min_d = df["_time"].min().date()
+            max_d = df["_time"].max().date()
+            date_range = st.date_input("时间范围", value=(min_d, max_d), min_value=min_d, max_value=max_d)
+            if len(date_range) == 2:
+                start_date, end_date = date_range
+            else:
+                start_date, end_date = min_d, max_d
+        else:
+            start_date = pd.Timestamp("2020-01-01")
+            end_date = pd.Timestamp.now()
+
+    # 数据处理
+    min_dt = pd.Timestamp(start_date)
+    max_dt = pd.Timestamp(end_date)
+    orders = prepare_orders(df, sku_col, qty_col, refund_col, country_col, name_col,
+                            fr_only, it_only, min_dt, max_dt)
+
+    if orders.empty:
+        st.warning("筛选后无有效订单。请检查筛选条件或数据格式。")
+        return
+
+    # 品牌过滤
+    if brand_filter:
+        orders = orders[orders["_brand"].isin(brand_filter)]
+
+    st.success(f"有效订单行数：{len(orders):,} | 产品数：{orders['_product'].nunique()}")
+
+    # ---- 产品级分析 ----
+    prod_df = product_analysis(orders)
+    prod_df = prod_df[prod_df["总销量"] >= min_sales]
+
+    st.markdown("---")
+    st.subheader("产品级海托排行榜")
+    st.caption(f"共 {len(prod_df)} 个产品达到最低销量阈值")
+    if not prod_df.empty:
+        st.dataframe(prod_df, use_container_width=True, hide_index=True)
+
+    # ---- 尺寸级分析 ----
+    recommended_sizes = pd.DataFrame()
+    if not prod_df.empty:
+        st.markdown("---")
+        st.subheader("尺寸级推荐表")
+        size_df = size_analysis(orders, min_sales)
+        if not size_df.empty:
+            recommended_sizes = size_df[size_df["推荐状态"] != "不建议"]
+            st.caption(f"共 {len(size_df)} 个产品-尺寸组合，其中推荐 {len(recommended_sizes)} 个")
+            st.dataframe(size_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("未识别到有效尺寸信息。请确保订单 SKU 中包含尺寸格式如 60mm、90mm。")
+
+    # ---- 颜色级分析 ----
+    color_df = pd.DataFrame()
+    if not recommended_sizes.empty:
+        st.markdown("---")
+        st.subheader("跨尺寸颜色表现表")
+        color_df = color_analysis(orders, prod_df, recommended_sizes)
+        if not color_df.empty:
+            st.caption(f"共 {len(color_df)} 个颜色")
+            st.dataframe(color_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("未识别到有效色号信息。")
+
+    # ---- 组合建议 ----
+    if not color_df.empty and not recommended_sizes.empty:
+        st.markdown("---")
+        st.subheader("最终组合建议表")
+        combo_df = generate_combos(orders, recommended_sizes, color_df, combo_size, max_combos)
+        if not combo_df.empty:
+            st.caption(f"共 {len(combo_df)} 个推荐组合（件数：{combo_size}）")
+            st.dataframe(combo_df, use_container_width=True, hide_index=True)
+
+            # 下载
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine="openpyxl") as writer:
+                prod_df.to_excel(writer, sheet_name="产品排行榜", index=False)
+                if not recommended_sizes.empty:
+                    recommended_sizes.to_excel(writer, sheet_name="尺寸推荐", index=False)
+                if not color_df.empty:
+                    color_df.to_excel(writer, sheet_name="颜色表现", index=False)
+                combo_df.to_excel(writer, sheet_name="组合建议", index=False)
+            st.download_button(
+                label="下载海托分析 Excel",
+                data=output.getvalue(),
+                file_name="海托组合分析.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        else:
+            st.info("无法生成有效组合。请调整筛选条件。")

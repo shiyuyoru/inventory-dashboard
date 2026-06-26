@@ -4,6 +4,7 @@ import re
 import io
 import plotly.express as px
 from io import BytesIO
+from sea_freight import render_sea_freight_tab
 
 # ============================================================
 # PAGE CONFIG & STYLE
@@ -518,9 +519,10 @@ if file:
     )
 
     # ---- 6 个顶层 Tab ----
-    t1, t2, t3, t4, t5, t6 = st.tabs([
+    t1, t2, t3, t4, t5, t6, t7 = st.tabs([
         "📊 库存分析", "🆕 新品池", "🗑️ 清仓清单",
         "📈 放量清单", "⚠️ 风险清单", "💰 领导决策清单",
+        "🚢 法国/意大利海托分析",
     ])
 
     with t1:
@@ -539,6 +541,8 @@ if file:
         render_risk(prod_all, sku_all, col_sku, col_amount)
     with t6:
         render_leader(prod_all, sku_all, col_sku, col_amount)
+    with t7:
+        render_sea_freight_tab()
 
 else:
     st.info("📂 请上传一个 Excel 文件开始分析")
