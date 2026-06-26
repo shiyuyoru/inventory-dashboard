@@ -125,19 +125,22 @@ def load_orders(file_bytes):
     # 列名标准化
     df.columns = df.columns.astype(str).str.strip()
 
-    # 时间列
-    time_col = None
+    # 时间列：优先付款时间，缺失时回退到下单时间
+    time_col_pay = None
+    time_col_order = None
     for c in df.columns:
         if "付款时间" in c:
-            time_col = c
-            break
-    if not time_col:
-        for c in df.columns:
-            if "下单时间" in c:
-                time_col = c
-                break
-    if time_col:
-        df["_time"] = pd.to_datetime(df[time_col], errors="coerce")
+            time_col_pay = c
+        if "下单时间" in c:
+            time_col_order = c
+    time_col = time_col_pay or time_col_order
+    if time_col_pay:
+        df["_time"] = pd.to_datetime(df[time_col_pay], errors="coerce")
+        if time_col_order:
+            order_t = pd.to_datetime(df[time_col_order], errors="coerce")
+            df["_time"] = df["_time"].fillna(order_t)
+    elif time_col_order:
+        df["_time"] = pd.to_datetime(df[time_col_order], errors="coerce")
 
     # 国家列
     country_col = None
