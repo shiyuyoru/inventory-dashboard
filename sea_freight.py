@@ -241,50 +241,111 @@ def prepare_orders(df, sku_col, qty_col, refund_col, country_col, name_col,
     if orders.empty:
         return orders
 
-    # ---- 产品识别（新逻辑） ----
-    store_vals = orders[store_col] if store_col else pd.Series([""] * len(orders))
+    # ---- 产品识别（两遍学习法） ----
+    # 前置函数：从纯数字 SKU 提取候选产品
+    def guess_from_sku(sku_str, use_4digit=False):
+        """从数值SKU提取产品型号"""
+        s = str(sku_str).strip()
+        if not s.isdigit(): return None
+        if len(s) > 15 or len(s) < 5: return None
+        if use_4digit:
+            return f"DT{s[:4]}"
+        return f"LW{s[:3]}"
 
-    # 1. 先从 SKU 识别（显式 LW/DT）
-    products = []
-    brands = []
-    for i, (idx, row) in enumerate(orders.iterrows()):
+    # 第一遍：非 D1 店铺 → 统一用 LW + 3位前缀
+    products = {}
+    brands = {}
+    for idx, row in orders.iterrows():
         sku = row[sku_col]
-        store = store_vals.iloc[i] if store_col else ""
-        prod, brand = extract_product_from_sku(sku, store)
-        products.append(prod)
-        brands.append(brand)
+        store = str(row[store_col]).strip().upper() if store_col else ""
 
-    orders["_product"] = products
-    orders["_brand"] = brands
+        # 1) 显式匹配 LWxxx / DTxxxx
+        explicit = extract_product(sku)
+        if explicit:
+            products[idx] = explicit
+            brands[idx] = "DT" if explicit.startswith("DT") else "LW"
+            continue
 
-    # 2. 回退：从 merch_sku / spec / name 列尝试显式识别
+        # 2) 纯数字 >15位 → 丢弃
+        s = str(sku).strip()
+        if s.isdigit() and len(s) > 15:
+            products[idx] = None
+            brands[idx] = None
+            continue
+
+        # 3) 多行 SKU 取首行
+        if "\n" in s:
+            s = s.split("\n")[0].strip()
+
+        # 4) 非 D1 店铺 → LW
+        if not store.startswith("D1"):
+            prod = guess_from_sku(s, use_4digit=False)
+            products[idx] = prod
+            brands[idx] = "LW" if prod else None
+        else:
+            # D1 店铺暂存，第二遍处理
+            products[idx] = None
+            brands[idx] = None
+
+    # 构建已知 LW 产品集合（来自非 D1 店铺 + 显式 LW）
+    known_lw_prefixes = set()
+    for idx, prod in products.items():
+        if prod and prod.startswith("LW"):
+            known_lw_prefixes.add(prod[2:])  # 存储 "216", "546" 等前缀
+
+    # 第二遍：处理 D1 店铺 + 未识别
+    for idx, row in orders.iterrows():
+        if products.get(idx) is not None:
+            continue  # 已识别
+
+        sku = row[sku_col]
+        store = str(row[store_col]).strip().upper() if store_col else ""
+        s = str(sku).strip()
+        if "\n" in s:
+            s = s.split("\n")[0].strip()
+
+        if store.startswith("D1"):
+            # D1 店铺：先看是否匹配已知 LW 前缀
+            lw3 = guess_from_sku(s, use_4digit=False)
+            if lw3 and lw3[2:] in known_lw_prefixes:
+                products[idx] = lw3
+                brands[idx] = "LW"
+            else:
+                dt4 = guess_from_sku(s, use_4digit=True)
+                products[idx] = dt4
+                brands[idx] = "DT" if dt4 else None
+        else:
+            # 非 D1 兜底
+            prod = guess_from_sku(s, use_4digit=False)
+            products[idx] = prod
+            brands[idx] = "LW" if prod else None
+
+    orders["_product"] = orders.index.map(products)
+    orders["_brand"] = orders.index.map(brands)
+
+    # 回退：从 merch_sku / spec / name 列尝试显式识别
     for fallback_col in [merch_sku_col, spec_col, name_col]:
         if fallback_col:
             mask = orders["_product"].isna()
             fallback_results = orders.loc[mask, fallback_col].apply(extract_product)
             orders.loc[mask, "_product"] = orders.loc[mask, "_product"].fillna(fallback_results)
-            # 更新品牌
             mask2 = orders["_brand"].isna()
             orders.loc[mask2, "_brand"] = orders.loc[mask2, "_product"].apply(
                 lambda x: ("DT" if str(x).startswith("DT") else "LW") if pd.notna(x) else None
             )
 
-    # 3. 如果有店铺但没有识别出产品 → 用店铺判断品牌 + SKU 前缀做产品
-    if store_col:
-        still_missing = orders["_product"].isna()
-        if still_missing.any():
-            for i in orders[still_missing].index:
-                sku = str(orders.loc[i, sku_col]).strip()
-                store = str(orders.loc[i, store_col]).strip()
-                if sku.isdigit() and 5 <= len(sku) <= 15:
-                    if store.upper().startswith("D1"):
-                        orders.loc[i, "_product"] = f"DT{sku[:4]}"
-                        orders.loc[i, "_brand"] = "DT"
-                    else:
-                        orders.loc[i, "_product"] = f"LW{sku[:3]}"
-                        orders.loc[i, "_brand"] = "LW"
+    # 最终兜底：仍然缺失的用 3 位前缀
+    still_missing = orders["_product"].isna()
+    if still_missing.any():
+        for idx in orders[still_missing].index:
+            s = str(orders.loc[idx, sku_col]).strip()
+            if "\n" in s:
+                s = s.split("\n")[0].strip()
+            if s.isdigit() and 5 <= len(s) <= 15:
+                orders.loc[idx, "_product"] = f"LW{s[:3]}"
+                orders.loc[idx, "_brand"] = "LW"
 
-    # 4. 过滤无产品
+    # 过滤无产品
     orders = orders[orders["_product"].notnull()].copy()
 
     # ---- 尺寸识别 ----
