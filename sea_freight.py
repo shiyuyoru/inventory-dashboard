@@ -55,6 +55,28 @@ def extract_color(text):
     return None
 
 
+def normalize_color(c):
+    """统一色号为 3 位字符串，例如 3→003, 4.0→004"""
+    if pd.isna(c): return ""
+    s = str(c).strip()
+    if s.endswith(".0"): s = s[:-2]
+    if s.isdigit() and len(s) <= 3: return s.zfill(3)
+    return s
+
+
+def format_combo(combo):
+    """格式化组合为 '003、004、002' 格式"""
+    if isinstance(combo, str):
+        s = combo.strip()
+        if re.fullmatch(r"\d{6,30}", s) and len(s) % 3 == 0:
+            parts = [s[i:i+3] for i in range(0, len(s), 3)]
+        else:
+            parts = [s]
+    else:
+        parts = [normalize_color(c) for c in combo]
+    return "、".join(p for p in parts if p)
+
+
 def extract_product_from_sku(sku_val, store_account=""):
     if pd.isna(sku_val): return None, None
     s = str(sku_val).strip()
@@ -252,6 +274,8 @@ def prepare_orders(df, sku_col, qty_col, refund_col, country_col, name_col,
             re.search(r"(\d{3})$", str(x).strip()) and re.search(r"(\d{3})$", str(x).strip()).group(1)
         )
     )
+    # 统一色号为 3 位
+    orders["_color"] = orders["_color"].apply(lambda c: normalize_color(c) if pd.notna(c) and c != "" else None)
 
     # ---- 数量与退款 ----
     orders["_qty"] = pd.to_numeric(orders[qty_col], errors="coerce").fillna(1) if qty_col else 1
@@ -441,6 +465,7 @@ def color_analysis(orders, recommended_products, recommended_sizes):
         "total_qty": "总销量", "n_orders": "订单数",
         "n_sizes_covered": "推荐尺寸覆盖数",
     })
+    final["色号"] = final["色号"].apply(normalize_color)
     cols = ["产品型号", "色号", "法国销量", "意大利销量", "总销量", "订单数",
             "推荐尺寸覆盖数", "颜色推荐分", "共用图片"]
     return final[cols].sort_values(["产品型号", "颜色推荐分"], ascending=[True, False])
@@ -597,16 +622,16 @@ def generate_product_combos(orders, recommended_sizes, color_scores,
         for item in scored:
             if len(selected) >= max_combos: break
             total, combo, ctype, _, _, _ = item
-            ckey = "".join(combo)
+            ckey = tuple(normalize_color(c) for c in combo)
 
             if types_count[ctype] >= {"爆款重复": max_repeat, "爆款核心": max_combos, "畅销多色": max_combos}[ctype]:
                 if ctype == "爆款重复": continue
 
-            # 去重
-            if any(c["组合"] == ckey for c in selected): continue
+            if any(c["_key"] == ckey for c in selected): continue
 
             selected.append({
-                "组合": ckey,
+                "_key": ckey,
+                "combo_tuple": combo,
                 "score": total,
                 "type": ctype,
                 "co_score": item[3],
@@ -615,15 +640,16 @@ def generate_product_combos(orders, recommended_sizes, color_scores,
             })
             types_count[ctype] += 1
 
-        # 生成预览字符串
+        # 生成预览和表格行
         previews = []
         for s in selected:
-            previews.append("、".join(list(s["组合"])))
+            formatted = format_combo(s["combo_tuple"])
+            previews.append(formatted)
             all_combo_rows.append({
                 "产品型号": prod,
                 "推荐尺寸": " / ".join(rec_sizes),
                 "组合类型": s["type"],
-                "推荐组合色号": "、".join(list(s["组合"])),
+                "推荐组合色号": formatted,
                 "组合件数": combo_size,
                 "是否共用图片": "是" if s["min_cov"] >= len(rec_sizes) else ("有限" if s["min_cov"] >= 2 else "否"),
                 "适用尺寸": " / ".join(rec_sizes) if s["min_cov"] >= len(rec_sizes) else rec_sizes[0],
