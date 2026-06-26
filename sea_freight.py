@@ -29,15 +29,68 @@ def is_italy(val):
 # 产品/尺寸/颜色识别
 # ============================================================
 def extract_product(text):
-    """从任意文本中提取 LW/DT 产品型号"""
+    """从任意文本中提取 LW/DT 产品型号（显式格式）"""
     if pd.isna(text):
         return None
     m = re.search(r"\b(LW\d{3,4}|DT\d{3,5})\b", str(text).strip())
     return m.group(1) if m else None
 
 
+def extract_product_from_sku(sku_val, store_account=""):
+    """
+    从数值 SKU + 店铺账号推断产品型号。
+    规则：
+    - D1 店铺 → DT 产品（提取 SKU 前缀作为产品标识）
+    - 其他店铺 → LW 产品（SKU 前3位数字为型号，如 216xxx → LW216）
+    - 纯数字且 >15 位的 SKU → 舍弃（平台 ID）
+    """
+    if pd.isna(sku_val):
+        return None, None
+    s = str(sku_val).strip()
+
+    # 1. 先尝试显式 LW/DT 格式
+    explicit = extract_product(s)
+    if explicit:
+        brand = "DT" if explicit.startswith("DT") else "LW"
+        return explicit, brand
+
+    # 2. 纯数字过滤：>15 位 → 舍弃
+    if s.isdigit() and len(s) > 15:
+        return None, None
+
+    # 3. 判断品牌
+    store_upper = str(store_account).strip().upper()
+    if store_upper.startswith("D1"):
+        brand = "DT"
+    else:
+        brand = "LW"
+
+    # 4. 从数值 SKU 前缀提取型号
+    if s.isdigit() and 5 <= len(s) <= 15:
+        if brand == "LW":
+            prefix = s[:3]
+            return f"LW{prefix}", brand
+        else:
+            # DT/D1 使用 4 位前缀
+            prefix = s[:4]
+            return f"DT{prefix}", brand
+
+    # 5. 包含换行的多 SKU 情况：取第一行
+    if "\n" in s:
+        first = s.split("\n")[0].strip()
+        if first.isdigit() and len(first) > 15:
+            return None, None
+        if first.isdigit() and 5 <= len(first) <= 15:
+            if brand == "LW":
+                return f"LW{first[:3]}", brand
+            else:
+                return f"DT{first[:4]}", brand
+
+    return None, None
+
+
 def extract_size(text):
-    """从 SKU/产品规格中提取尺寸 mm"""
+    """从 SKU/产品规格/商品名称中提取尺寸 mm"""
     if pd.isna(text):
         return None
     s = str(text).strip()
@@ -59,7 +112,6 @@ def extract_color(text):
         if len(code) == 3:
             return code
         if len(code) == 4:
-            # 尝试清洗为标准 3 位色号
             return code[:3]
     return None
 
@@ -138,13 +190,36 @@ def load_orders(file_bytes):
             name_col = c
             break
 
-    return df, sku_col, qty_col, refund_col, country_col, time_col, name_col
+    # 店铺账号
+    store_col = None
+    for c in df.columns:
+        if "店铺账号" in c or "店铺" in c or "账号" in c:
+            store_col = c
+            break
+
+    # 产品规格（可能包含尺寸/颜色信息）
+    spec_col = None
+    for c in df.columns:
+        if "产品规格" in c or "规格" in c:
+            spec_col = c
+            break
+
+    # 商品SKU（可能包含 LW/DT 前缀）
+    merch_sku_col = None
+    for c in df.columns:
+        if "商品SKU" in c or "商品编码" in c:
+            merch_sku_col = c
+            break
+
+    return df, sku_col, qty_col, refund_col, country_col, time_col, name_col, store_col, spec_col, merch_sku_col
 
 
 # ============================================================
 # 筛选 + 识别
 # ============================================================
-def prepare_orders(df, sku_col, qty_col, refund_col, country_col, name_col, fr_only, it_only, min_date, max_date):
+def prepare_orders(df, sku_col, qty_col, refund_col, country_col, name_col,
+                   store_col, spec_col, merch_sku_col,
+                   fr_only, it_only, min_date, max_date):
     """筛选法意订单，识别产品、尺寸、颜色"""
     orders = df.copy()
 
@@ -163,19 +238,62 @@ def prepare_orders(df, sku_col, qty_col, refund_col, country_col, name_col, fr_o
     if orders.empty:
         return orders
 
-    # 产品识别
-    orders["_product"] = orders[sku_col].apply(extract_product)
-    if name_col and orders["_product"].isna().any():
-        fallback = orders[name_col].apply(extract_product)
-        orders["_product"] = orders["_product"].fillna(fallback)
+    # ---- 产品识别（新逻辑） ----
+    store_vals = orders[store_col] if store_col else pd.Series([""] * len(orders))
 
+    # 1. 先从 SKU 识别（显式 LW/DT）
+    products = []
+    brands = []
+    for i, (idx, row) in enumerate(orders.iterrows()):
+        sku = row[sku_col]
+        store = store_vals.iloc[i] if store_col else ""
+        prod, brand = extract_product_from_sku(sku, store)
+        products.append(prod)
+        brands.append(brand)
+
+    orders["_product"] = products
+    orders["_brand"] = brands
+
+    # 2. 回退：从 merch_sku / spec / name 列尝试显式识别
+    for fallback_col in [merch_sku_col, spec_col, name_col]:
+        if fallback_col:
+            mask = orders["_product"].isna()
+            fallback_results = orders.loc[mask, fallback_col].apply(extract_product)
+            orders.loc[mask, "_product"] = orders.loc[mask, "_product"].fillna(fallback_results)
+            # 更新品牌
+            mask2 = orders["_brand"].isna()
+            orders.loc[mask2, "_brand"] = orders.loc[mask2, "_product"].apply(
+                lambda x: ("DT" if str(x).startswith("DT") else "LW") if pd.notna(x) else None
+            )
+
+    # 3. 如果有店铺但没有识别出产品 → 用店铺判断品牌 + SKU 前缀做产品
+    if store_col:
+        still_missing = orders["_product"].isna()
+        if still_missing.any():
+            for i in orders[still_missing].index:
+                sku = str(orders.loc[i, sku_col]).strip()
+                store = str(orders.loc[i, store_col]).strip()
+                if sku.isdigit() and 5 <= len(sku) <= 15:
+                    if store.upper().startswith("D1"):
+                        orders.loc[i, "_product"] = f"DT{sku[:4]}"
+                        orders.loc[i, "_brand"] = "DT"
+                    else:
+                        orders.loc[i, "_product"] = f"LW{sku[:3]}"
+                        orders.loc[i, "_brand"] = "LW"
+
+    # 4. 过滤无产品
     orders = orders[orders["_product"].notnull()].copy()
 
-    # 品牌
-    orders["_brand"] = orders["_product"].apply(lambda x: x[:2])
-
-    # 尺寸识别
+    # ---- 尺寸识别 ----
+    # 从 SKU 识别
     orders["_size"] = orders[sku_col].apply(extract_size)
+    # 回退：从 spec / name 识别
+    if spec_col:
+        mask = orders["_size"].isna()
+        orders.loc[mask, "_size"] = orders.loc[mask, spec_col].apply(extract_size)
+    if name_col:
+        mask = orders["_size"].isna()
+        orders.loc[mask, "_size"] = orders.loc[mask, name_col].apply(extract_size)
 
     # 颜色识别
     orders["_color"] = orders[sku_col].apply(extract_color)
@@ -618,7 +736,7 @@ def render_sea_freight_tab():
         st.info("请上传店小秘订单导出表开始分析。")
         return
 
-    df, sku_col, qty_col, refund_col, country_col, time_col, name_col = load_orders(order_file.getvalue())
+    df, sku_col, qty_col, refund_col, country_col, time_col, name_col, store_col, spec_col, merch_sku_col = load_orders(order_file.getvalue())
 
     if df.empty:
         st.error("订单表为空或无法读取。")
@@ -651,6 +769,7 @@ def render_sea_freight_tab():
     min_dt = pd.Timestamp(start_date)
     max_dt = pd.Timestamp(end_date)
     orders = prepare_orders(df, sku_col, qty_col, refund_col, country_col, name_col,
+                            store_col, spec_col, merch_sku_col,
                             fr_only, it_only, min_dt, max_dt)
 
     if orders.empty:
