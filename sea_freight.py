@@ -77,6 +77,98 @@ def format_combo(combo):
     return "、".join(p for p in parts if p)
 
 
+SEA_BADGE_COLORS = {
+    "强烈推荐": ("#dcfce7", "#166534"),
+    "推荐": ("#dbeafe", "#1d4ed8"),
+    "可测试": ("#fef3c7", "#92400e"),
+    "暂不推荐": ("#f1f5f9", "#475569"),
+    "高风险": ("#fee2e2", "#b91c1c"),
+    "爆款重复": ("#fef3c7", "#92400e"),
+    "爆款核心": ("#dbeafe", "#1d4ed8"),
+    "畅销多色": ("#dcfce7", "#166534"),
+    "共购组合": ("#ede9fe", "#6d28d9"),
+    "单尺寸特化": ("#f1f5f9", "#475569"),
+    "主推尺寸": ("#dcfce7", "#166534"),
+    "次推尺寸": ("#dbeafe", "#1d4ed8"),
+    "第三尺寸": ("#ede9fe", "#6d28d9"),
+    "备选尺寸": ("#fef3c7", "#92400e"),
+    "不建议": ("#f1f5f9", "#475569"),
+    "是": ("#dcfce7", "#166534"),
+    "有限": ("#fef3c7", "#92400e"),
+    "否": ("#f1f5f9", "#475569"),
+}
+
+
+def render_metric_cards(items):
+    cols = st.columns(min(len(items), 6))
+    for col, item in zip(cols, items):
+        label, value, help_text = (list(item) + [""])[:3]
+        col.metric(label, value, help=help_text or None)
+
+
+def truncate_text(value, max_len=46):
+    if pd.isna(value):
+        return ""
+    text = str(value)
+    return text if len(text) <= max_len else text[:max_len - 1] + "…"
+
+
+def _format_table_value(value):
+    if isinstance(value, float):
+        return f"{value:,.1f}"
+    if isinstance(value, int):
+        return f"{value:,}"
+    return value
+
+
+def style_table(df):
+    badge_cols = [
+        c for c in ["海托推荐等级", "风险标签", "组合类型", "推荐状态", "是否共用图片"]
+        if c in df.columns
+    ]
+    numeric_cols = df.select_dtypes(include="number").columns.tolist()
+
+    def badge_style(value):
+        text = str(value)
+        for key, (bg, fg) in SEA_BADGE_COLORS.items():
+            if key == text or key in text:
+                return f"background-color:{bg}; color:{fg}; font-weight:600; border-radius:6px;"
+        return ""
+
+    styler = df.style
+    if numeric_cols:
+        styler = styler.format({c: _format_table_value for c in numeric_cols})
+        styler = styler.set_properties(subset=numeric_cols, **{"text-align": "right"})
+    if badge_cols:
+        styler = styler.applymap(badge_style, subset=badge_cols)
+    return styler
+
+
+def show_table(df, columns=None, text_cols=None, height=420):
+    if df.empty:
+        st.info("暂无数据")
+        return
+    display_df = df[[c for c in columns if c in df.columns]].copy() if columns else df.copy()
+    for col in text_cols or []:
+        if col in display_df.columns:
+            display_df[col] = display_df[col].apply(truncate_text)
+    st.dataframe(style_table(display_df), use_container_width=True, hide_index=True, height=height)
+
+
+def df_to_csv(df):
+    return df.to_csv(index=False).encode("utf-8-sig")
+
+
+def build_combo_preview(combo_df, fallback_text=""):
+    if not combo_df.empty and "推荐组合色号" in combo_df.columns:
+        combos = combo_df["推荐组合色号"].dropna().astype(str).tolist()
+    else:
+        combos = [c.strip() for c in str(fallback_text).split(" | ") if c.strip()]
+    if not combos:
+        return ""
+    return f"{combos[0]} 等 {len(combos)} 组"
+
+
 def extract_product_from_sku(sku_val, store_account=""):
     if pd.isna(sku_val): return None, None
     s = str(sku_val).strip()
@@ -862,6 +954,15 @@ def render_sea_freight_tab():
         else:
             start_date, end_date = pd.Timestamp("2020-01-01"), pd.Timestamp.now()
 
+    st.subheader("筛选条件")
+    filter_cols = st.columns(5)
+    filter_cols[0].metric("国家", "法国+意大利" if fr_only and it_only else ("法国" if fr_only else "意大利"))
+    filter_cols[1].metric("品牌", " / ".join(brand_filter) if brand_filter else "全部")
+    filter_cols[2].metric("最低销量", min_sales)
+    filter_cols[3].metric("组合件数", combo_size)
+    filter_cols[4].metric("每产品组合数", max_combos)
+    st.caption("上传文件后可先调整左侧筛选条件，点击「开始分析」后才会运行完整计算。")
+
     # ---- 预处理 ----
     min_dt, max_dt = pd.Timestamp(start_date), pd.Timestamp(end_date)
     orders = prepare_orders(df, sku_col, qty_col, refund_col, country_col, name_col,
@@ -911,45 +1012,110 @@ def render_sea_freight_tab():
         prod_df = prod_df[prod_df["总销量"] >= min_sales]
 
     elapsed = time.time() - t0
+    combo_preview_map = {}
+    if not combo_df.empty:
+        combo_preview_map = {
+            prod: build_combo_preview(grp)
+            for prod, grp in combo_df.groupby("产品型号", sort=False)
+        }
+    if not prod_df.empty:
+        prod_df = prod_df.copy()
+        prod_df["推荐组合"] = prod_df.apply(
+            lambda r: combo_preview_map.get(r["产品型号"], build_combo_preview(pd.DataFrame(), r.get("推荐组合", ""))),
+            axis=1,
+        )
+
+    def refund_pct(series):
+        if series.empty:
+            return pd.Series(dtype=float)
+        return pd.to_numeric(series.astype(str).str.rstrip("%"), errors="coerce").fillna(0)
+
+    high_risk_count = int((refund_pct(prod_df["退款风险"]) >= 15).sum()) if "退款风险" in prod_df.columns else 0
+    strong_count = int((prod_df["海托推荐等级"] == "强烈推荐").sum()) if "海托推荐等级" in prod_df.columns else 0
+    if "退款风险" in prod_df.columns:
+        prod_df["风险标签"] = refund_pct(prod_df["退款风险"]).apply(lambda v: "高风险" if v >= 15 else "正常")
+
     st.success(f"分析完成，耗时 {elapsed:.1f} 秒")
+    st.subheader("分析总览")
+    render_metric_cards([
+        ("分析产品数", f"{len(prod_df):,}", "满足筛选条件的产品数量"),
+        ("强烈推荐产品", f"{strong_count:,}", "销量、尺寸覆盖和退款风险均较好的产品"),
+        ("推荐组合数", f"{len(combo_df):,}", "最终组合建议表中的组合数量"),
+        ("高风险产品", f"{high_risk_count:,}", "退款风险大于等于 15% 的产品"),
+        ("有效订单行数", f"{len(orders):,}", "筛选后的订单明细行数"),
+        ("分析耗时", f"{elapsed:.1f}s", "本次完整分析耗时"),
+    ])
 
     # ---- 产品级海托排行榜 ----
     st.markdown("---")
     st.subheader("产品级海托排行榜")
-    st.caption(f"共 {len(prod_df)} 个产品 | 组合件数：{combo_size} | 点击查看推荐组合详情")
+    st.caption("产品表只显示组合简短预览，完整组合明细请查看下方「最终组合建议表」。")
     if not prod_df.empty:
-        st.dataframe(prod_df, use_container_width=True, hide_index=True)
+        product_cols = [
+            "产品型号", "品牌", "法国销量", "意大利销量", "总销量", "总订单数", "包裹数",
+            "有销量尺寸数", "有销量色号数", "月份覆盖数", "退款风险", "风险标签", "海托推荐等级", "推荐组合", "推荐理由",
+        ]
+        show_table(prod_df, product_cols, text_cols=["推荐理由"], height=430)
 
     # ---- 尺寸级推荐表 ----
     if not size_df.empty:
         st.markdown("---")
         st.subheader("尺寸级推荐表")
-        st.caption(f"共 {len(size_df)} 个产品-尺寸组合 | 推荐 {len(recommended_sizes)} 个（仅主推/次推/第三尺寸参与组合分析）")
-        st.dataframe(size_df, use_container_width=True, hide_index=True)
+        st.caption(f"共 {len(size_df)} 个产品-尺寸组合 | 推荐 {len(recommended_sizes)} 个。仅主推/次推/第三尺寸参与颜色组合分析，备选尺寸只在本表展示。")
+        show_table(size_df, height=430)
 
     # ---- 颜色表现表 ----
     if not color_df.empty:
         st.markdown("---")
         st.subheader("跨尺寸颜色表现表")
-        st.caption(f"共 {len(color_df)} 个颜色（仅推荐尺寸范围内）")
-        st.dataframe(color_df, use_container_width=True, hide_index=True)
-
-    # ---- 共购关系表 ----
-    if not co_purchase_df.empty:
-        st.markdown("---")
-        st.subheader("颜色共购关系表")
-        st.caption(f"共 {len(co_purchase_df)} 对共购关系")
-        st.dataframe(co_purchase_df, use_container_width=True, hide_index=True)
+        st.caption(f"共 {len(color_df)} 个颜色。该表只统计主推/次推/第三尺寸范围内的颜色表现。")
+        show_table(color_df, height=430)
 
     # ---- 最终组合建议表 ----
+    st.markdown("---")
+    st.subheader("最终组合建议表")
     if not combo_df.empty:
-        st.markdown("---")
-        st.subheader("最终组合建议表")
-        st.caption(f"共 {len(combo_df)} 个推荐组合（件数：{combo_size}）")
-        st.dataframe(combo_df, use_container_width=True, hide_index=True)
+        st.caption(f"共 {len(combo_df)} 个推荐组合（件数：{combo_size}）。这里是组合明细主表，产品排行榜中仅保留简短预览。")
+        combo_cols = [
+            "产品型号", "推荐尺寸", "组合类型", "推荐组合色号", "组合件数", "是否共用图片",
+            "适用尺寸", "组合推荐分", "推荐理由", "注意事项",
+        ]
+        show_table(combo_df, combo_cols, text_cols=["推荐理由", "注意事项"], height=520)
+        with st.expander("查看完整推荐理由和注意事项", expanded=False):
+            detail_cols = [c for c in ["产品型号", "推荐组合色号", "推荐理由", "注意事项"] if c in combo_df.columns]
+            st.dataframe(combo_df[detail_cols], use_container_width=True, hide_index=True)
+    else:
+        st.info("暂无最终组合建议。可尝试降低最低销量阈值，或检查订单中是否识别到产品、尺寸、色号。")
 
     # ---- 下载 ----
+    st.markdown("---")
+    st.subheader("导出区域")
     if not prod_df.empty:
+        c1, c2, c3 = st.columns(3)
+        c1.download_button(
+            label="导出产品级海托排行榜 CSV",
+            data=df_to_csv(prod_df),
+            file_name="产品级海托排行榜.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+        if not size_df.empty:
+            c2.download_button(
+                label="导出尺寸级推荐表 CSV",
+                data=df_to_csv(size_df),
+                file_name="尺寸级推荐表.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+        if not combo_df.empty:
+            c3.download_button(
+                label="导出最终组合建议表 CSV",
+                data=df_to_csv(combo_df),
+                file_name="最终组合建议表.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
             prod_df.to_excel(writer, sheet_name="产品排行榜", index=False)
@@ -966,4 +1132,5 @@ def render_sea_freight_tab():
             data=output.getvalue(),
             file_name="海托组合分析.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
         )

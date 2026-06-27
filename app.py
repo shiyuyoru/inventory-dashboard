@@ -12,12 +12,54 @@ from sea_freight import render_sea_freight_tab
 st.set_page_config(page_title="库存决策系统 V5.3", layout="wide")
 st.markdown("""
 <style>
-  .stApp { background: #f8fafc; }
+  :root {
+    --bg: #f6f7f9;
+    --card: #ffffff;
+    --line: #e5e7eb;
+    --muted: #64748b;
+    --text: #0f172a;
+  }
+  .stApp { background: var(--bg); color: var(--text); }
   header[data-testid="stHeader"] { background: transparent !important; }
-  .stTabs [data-baseweb="tab"] { font-weight: 500; border-radius: 8px 8px 0 0; padding: 8px 16px; }
-  .stExpander { border-radius: 10px; border: 1px solid #e2e8f0; box-shadow: none; }
-  div[data-testid="stMetric"] { background: white; border-radius: 10px; padding: 12px; border: 1px solid #f1f5f9; }
-  .stPlotlyChart { background: white; border-radius: 12px; padding: 12px; border: 1px solid #f1f5f9; box-shadow: 0 1px 2px rgba(0,0,0,0.04); }
+  .block-container { padding-top: 2rem; padding-bottom: 3rem; }
+  h1, h2, h3 { letter-spacing: 0; color: var(--text); }
+  h1 { font-size: 1.75rem !important; font-weight: 750 !important; }
+  h2 { font-size: 1.35rem !important; }
+  h3 { font-size: 1.05rem !important; }
+  .stTabs [data-baseweb="tab"] {
+    font-weight: 600;
+    border-radius: 8px 8px 0 0;
+    padding: 10px 16px;
+  }
+  .stExpander {
+    border-radius: 8px;
+    border: 1px solid var(--line);
+    box-shadow: none;
+    background: var(--card);
+  }
+  div[data-testid="stMetric"] {
+    background: var(--card);
+    border-radius: 8px;
+    padding: 14px 16px;
+    border: 1px solid var(--line);
+    box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+  }
+  div[data-testid="stMetric"] label {
+    color: var(--muted);
+    font-size: 0.82rem;
+  }
+  .stPlotlyChart, div[data-testid="stDataFrame"], div[data-testid="stTable"] {
+    background: var(--card);
+    border-radius: 8px;
+    padding: 10px;
+    border: 1px solid var(--line);
+    box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+  }
+  .section-note {
+    color: var(--muted);
+    font-size: 0.9rem;
+    margin: -0.25rem 0 0.65rem 0;
+  }
 </style>
 """, unsafe_allow_html=True)
 st.title("库存决策系统 V5.3")
@@ -41,6 +83,70 @@ COLOR_MAP = {
     "💀 死库存": "#94a3b8",
     "🆕 新品池": "#0ea5e9",
 }
+
+BADGE_COLORS = {
+    "强烈推荐": ("#dcfce7", "#166534"),
+    "推荐": ("#dbeafe", "#1d4ed8"),
+    "可测试": ("#fef3c7", "#92400e"),
+    "暂不推荐": ("#f1f5f9", "#475569"),
+    "高风险": ("#fee2e2", "#b91c1c"),
+    "极高风险": ("#fee2e2", "#991b1b"),
+    "中风险": ("#fef3c7", "#92400e"),
+    "低风险": ("#dbeafe", "#1d4ed8"),
+    "优质": ("#dcfce7", "#166534"),
+    "新品观察": ("#e0f2fe", "#0369a1"),
+    "热销": ("#dcfce7", "#166534"),
+    "主销": ("#dbeafe", "#1d4ed8"),
+    "弱动销": ("#fef3c7", "#92400e"),
+    "滞销": ("#fee2e2", "#b91c1c"),
+    "死库存": ("#f1f5f9", "#475569"),
+    "新品池": ("#e0f2fe", "#0369a1"),
+}
+
+
+def render_overview_cards(items):
+    """展示统一的顶部指标卡。items: [(标题, 值, 说明)]"""
+    if not items:
+        return
+    cols = st.columns(min(len(items), 6))
+    for col, item in zip(cols, items):
+        label, value, help_text = (list(item) + [""])[:3]
+        col.metric(label, value, help=help_text or None)
+
+
+def _format_value(v):
+    if isinstance(v, float):
+        return f"{v:,.1f}"
+    if isinstance(v, int):
+        return f"{v:,}"
+    return v
+
+
+def _truncate_text(v, max_len=42):
+    if pd.isna(v):
+        return ""
+    s = str(v)
+    return s if len(s) <= max_len else s[:max_len - 1] + "…"
+
+
+def style_dataframe(df):
+    badge_cols = [c for c in ["海托推荐等级", "风险等级", "产品分类", "销售动作", "处理建议"] if c in df.columns]
+    numeric_cols = df.select_dtypes(include="number").columns.tolist()
+
+    def badge_style(val):
+        text = str(val)
+        for key, (bg, fg) in BADGE_COLORS.items():
+            if key in text:
+                return f"background-color:{bg}; color:{fg}; font-weight:600; border-radius:6px;"
+        return ""
+
+    styler = df.style
+    if numeric_cols:
+        styler = styler.format({c: _format_value for c in numeric_cols})
+        styler = styler.set_properties(subset=numeric_cols, **{"text-align": "right"})
+    if badge_cols:
+        styler = styler.applymap(badge_style, subset=badge_cols)
+    return styler
 
 # ============================================================
 # ① 产品识别
@@ -239,7 +345,11 @@ def show_table(df, cols, sort_by=None, ascending=False):
     avail = [c for c in cols if c in df.columns]
     if sort_by and sort_by in df.columns:
         df = df.sort_values(sort_by, ascending=ascending)
-    st.dataframe(df[avail], use_container_width=True, hide_index=True)
+    display_df = df[avail].copy()
+    for c in ["处理建议", "推荐理由"]:
+        if c in display_df.columns:
+            display_df[c] = display_df[c].apply(_truncate_text)
+    st.dataframe(style_dataframe(display_df), use_container_width=True, hide_index=True)
 
 # ============================================================
 # ⑦ 渲染：库存分析（保留原有饼图+折叠表）
@@ -249,9 +359,16 @@ def render_analysis(prod, sku, col_sku, col_amount, brand):
     if prod.empty:
         st.info("无该品牌产品")
         return
+    render_overview_cards([
+        ("分析产品数", f"{len(prod):,}", "当前品牌识别到的产品数量"),
+        ("热销/主销", f"{len(prod[prod['产品分类'].isin(['🟩 热销', '🟩 主销'])]):,}", "适合重点补货和放量的产品"),
+        ("高风险产品", f"{len(prod[prod['风险等级'].isin(['极高风险', '高风险'])]):,}", "极高风险和高风险产品"),
+        ("库存金额", f"¥{prod['库存金额'].sum():,.0f}", "当前品牌库存资金占用"),
+    ])
 
     # 产品层
     st.subheader("产品")
+    st.markdown("<div class='section-note'>按产品聚合查看库存、销量、健康评分和处理动作。</div>", unsafe_allow_html=True)
     c1, c2 = st.columns(2)
     all_levels = list(COLOR_MAP.keys())
     with c1:
@@ -278,6 +395,7 @@ def render_analysis(prod, sku, col_sku, col_amount, brand):
 
     st.divider()
     st.subheader("SKU")
+    st.markdown("<div class='section-note'>SKU 维度用于定位具体库存项，适合执行补货、清仓或广告动作。</div>", unsafe_allow_html=True)
     if sku is None:
         st.info("未识别到 SKU 列")
         return
@@ -312,7 +430,12 @@ def render_new_products(prod, sku, col_sku, col_amount, has_create_time):
         st.info("未检测到「创建时间」列，无法识别新品。新品池暂为空。")
         return
     p_new = prod[prod["产品分类"] == "🆕 新品池"]
-    st.markdown(f"**新品数量：{len(p_new)} 个**")
+    render_overview_cards([
+        ("新品产品数", f"{len(p_new):,}", "创建时间在 90 天内的产品"),
+        ("新品库存金额", f"¥{p_new['库存金额'].sum():,.0f}", "新品池库存资金占用"),
+        ("新品销量", f"{p_new['90天内销量'].sum():,}", "新品近 90 天销量"),
+        ("新品 SKU", f"{len(sku[sku['产品分类'] == '🆕 新品池']):,}" if sku is not None else "0", "新品 SKU 数量"),
+    ])
     if not p_new.empty:
         st.caption("定义：创建时间 ≤ 90天。新品不进入清仓/风险系统，统一标记为「新品观察」。")
         cols = ["产品ID", "可用库存", "90天内销量", "库存金额", "周转率", "销售动作", "产品健康评分"]
@@ -332,7 +455,12 @@ def render_clearance(prod, sku, col_sku, col_amount):
     st.header("🗑️ 清仓清单")
     p_clear = prod[prod["销售动作"].isin(["🟥 清仓（停广告+降价）", "🟥 强清仓"])]
     p_clear = p_clear.sort_values("清仓评分", ascending=False)
-    st.markdown(f"**清仓产品：{len(p_clear)} 个**")
+    render_overview_cards([
+        ("清仓产品数", f"{len(p_clear):,}", "触发清仓或强清仓动作的产品"),
+        ("死库存", f"{len(p_clear[p_clear['90天内销量'] == 0]):,}", "90 天内销量为 0 的清仓产品"),
+        ("清仓库存金额", f"¥{p_clear['库存金额'].sum():,.0f}", "清仓产品库存资金占用"),
+        ("最高清仓评分", f"{p_clear['清仓评分'].max():,.0f}" if not p_clear.empty else "0", "分数越高越优先处理"),
+    ])
     st.caption("按清仓评分从高到低排列，分数越高越优先处理。")
     if not p_clear.empty:
         cols = ["产品ID", "可用库存", "90天内销量", "库存金额", "周转率", "风险等级", "清仓评分", "优先级评分", "处理建议"]
@@ -355,7 +483,12 @@ def render_scaleup(prod, sku, col_sku, col_amount):
     st.header("📈 放量清单")
     p_scale = prod[prod["销售动作"].isin(["🟩 扩量", "🟧 放量"])]
     p_scale = p_scale.sort_values("90天内销量", ascending=False)
-    st.markdown(f"**放量产品：{len(p_scale)} 个**")
+    render_overview_cards([
+        ("放量产品数", f"{len(p_scale):,}", "触发扩量或放量动作的产品"),
+        ("90天销量", f"{p_scale['90天内销量'].sum():,}", "放量产品近 90 天销量"),
+        ("库存金额", f"¥{p_scale['库存金额'].sum():,.0f}", "放量产品库存资金占用"),
+        ("平均健康分", f"{p_scale['产品健康评分'].mean():.1f}" if not p_scale.empty else "0", "产品健康评分均值"),
+    ])
     st.caption("热销和主销产品，适合加广告、扩颜色/尺寸。")
     if not p_scale.empty:
         cols = ["产品ID", "可用库存", "90天内销量", "库存金额", "周转率", "产品健康评分", "销售动作", "处理建议"]
@@ -381,7 +514,12 @@ def render_risk(prod, sku, col_sku, col_amount):
     p_risk["_r"] = p_risk["风险等级"].map(risk_order)
     p_risk = p_risk.sort_values(["_r", "库存金额"], ascending=[True, False])
     p_risk.drop(columns=["_r"], inplace=True)
-    st.markdown(f"**风险产品：{len(p_risk)} 个**")
+    render_overview_cards([
+        ("风险产品数", f"{len(p_risk):,}", "极高风险、高风险和中风险产品"),
+        ("高风险以上", f"{len(p_risk[p_risk['风险等级'].isin(['极高风险', '高风险'])]):,}", "需要优先关注的产品"),
+        ("风险库存金额", f"¥{p_risk['库存金额'].sum():,.0f}", "风险产品库存资金占用"),
+        ("中风险产品", f"{len(p_risk[p_risk['风险等级'] == '中风险']):,}", "中风险产品数量"),
+    ])
     if not p_risk.empty:
         cols = ["产品ID", "可用库存", "90天内销量", "库存金额", "周转率", "风险等级", "产品健康评分", "处理建议"]
         show_table(p_risk, cols)
@@ -411,12 +549,13 @@ def render_leader(prod, sku, col_sku, col_amount):
     p3 = prod[prod["处理建议"] == "🟩 可以放量"]
     total_inv = prod["库存金额"].sum()
 
-    c0, c1, c2, c3 = st.columns(4)
-    c0.metric("🟥 必须立即清仓", len(p0))
-    c1.metric("🟧 尽快处理", len(p1))
-    c2.metric("🟨 观察优化", len(p2))
-    c3.metric("🟩 可以放量", len(p3))
-    st.metric("💰 库存总金额", f"¥{total_inv:,.0f}")
+    render_overview_cards([
+        ("必须立即清仓", f"{len(p0):,}", "资金卡死的高优先级项"),
+        ("尽快处理", f"{len(p1):,}", "低周转且资金占用偏高"),
+        ("观察优化", f"{len(p2):,}", "需要优化测试的产品"),
+        ("可以放量", f"{len(p3):,}", "适合继续放量"),
+        ("库存总金额", f"¥{total_inv:,.0f}", "全部产品库存资金占用"),
+    ])
 
     # 下载
     output = BytesIO()
@@ -477,59 +616,82 @@ def build_full_export(prod_all, sku_all, col_sku, col_amount):
 # ============================================================
 file = st.file_uploader("上传库存 Excel 文件", type=["xlsx"], key="inventory_upload")
 
-inventory_ready = False
 if file:
-    df, col_sku, col_amount, col_price, col_create, filtered = load_data(file.getvalue())
-    if filtered:
-        st.caption(f"已过滤 {filtered} 行无法识别为 LW/DT 产品的数据")
-    if not col_price:
-        st.caption("未识别到「单价」列，库存金额由总价列推算")
-    if not col_create:
-        st.caption("未识别到「创建时间」列，新品池暂不可用")
+    file_id = f"{file.name}:{getattr(file, 'size', 0)}"
+    if st.session_state.get("_inventory_file_id") != file_id:
+        st.session_state["_inventory_ready"] = False
+        st.session_state["_inventory_file_id"] = file_id
 
-    # ---- 按品牌聚合 ----
-    results = {}
-    for brand in ["LW", "DT"]:
-        df_b = df[df["品牌"] == brand].copy()
-        if df_b.empty:
-            results[brand] = (pd.DataFrame(), None)
-        else:
-            results[brand] = aggregate_and_enrich(df_b, col_sku, col_amount)
+    st.caption(f"已选择文件：{file.name}。点击下方按钮后开始计算库存分析。")
+    if st.button("开始分析库存数据", type="primary", use_container_width=True):
+        with st.spinner("正在分析库存数据..."):
+            df, col_sku, col_amount, col_price, col_create, filtered = load_data(file.getvalue())
+            if filtered:
+                st.caption(f"已过滤 {filtered} 行无法识别为 LW/DT 产品的数据")
+            if not col_price:
+                st.caption("未识别到「单价」列，库存金额由总价列推算")
+            if not col_create:
+                st.caption("未识别到「创建时间」列，新品池暂不可用")
 
-    prod_lw, sku_lw = results["LW"]
-    prod_dt, sku_dt = results["DT"]
+            # ---- 按品牌聚合 ----
+            results = {}
+            for brand in ["LW", "DT"]:
+                df_b = df[df["品牌"] == brand].copy()
+                if df_b.empty:
+                    results[brand] = (pd.DataFrame(), None)
+                else:
+                    results[brand] = aggregate_and_enrich(df_b, col_sku, col_amount)
 
-    # ---- 合并（带品牌字段） ----
-    prod_lw_tag = prod_lw.copy(); prod_lw_tag["品牌"] = "LW"
-    prod_dt_tag = prod_dt.copy(); prod_dt_tag["品牌"] = "DT"
-    prod_all = pd.concat([prod_lw_tag, prod_dt_tag], ignore_index=True) if not prod_lw.empty or not prod_dt.empty else prod_lw_tag
+            prod_lw, sku_lw = results["LW"]
+            prod_dt, sku_dt = results["DT"]
 
-    sku_all = None
-    if sku_lw is not None and sku_dt is not None:
-        sku_lw_tag = sku_lw.copy(); sku_lw_tag["品牌"] = "LW"
-        sku_dt_tag = sku_dt.copy(); sku_dt_tag["品牌"] = "DT"
-        sku_all = pd.concat([sku_lw_tag, sku_dt_tag], ignore_index=True)
+            # ---- 合并（带品牌字段） ----
+            prod_lw_tag = prod_lw.copy(); prod_lw_tag["品牌"] = "LW"
+            prod_dt_tag = prod_dt.copy(); prod_dt_tag["品牌"] = "DT"
+            prod_all = pd.concat([prod_lw_tag, prod_dt_tag], ignore_index=True) if not prod_lw.empty or not prod_dt.empty else prod_lw_tag
 
-    # ---- 全量导出 ----
-    export_data = build_full_export(prod_all, sku_all, col_sku, col_amount)
+            sku_all = None
+            if sku_lw is not None and sku_dt is not None:
+                sku_lw_tag = sku_lw.copy(); sku_lw_tag["品牌"] = "LW"
+                sku_dt_tag = sku_dt.copy(); sku_dt_tag["品牌"] = "DT"
+                sku_all = pd.concat([sku_lw_tag, sku_dt_tag], ignore_index=True)
+
+            # 存入 session_state 供 tabs 使用
+            st.session_state["_inv_prod_lw"] = prod_lw
+            st.session_state["_inv_prod_dt"] = prod_dt
+            st.session_state["_inv_prod_all"] = prod_all
+            st.session_state["_inv_sku_lw"] = sku_lw
+            st.session_state["_inv_sku_dt"] = sku_dt
+            st.session_state["_inv_sku_all"] = sku_all
+            st.session_state["_inv_col_sku"] = col_sku
+            st.session_state["_inv_col_amount"] = col_amount
+            st.session_state["_inv_col_create"] = bool(col_create)
+            st.session_state["_inventory_ready"] = True
+        st.success("库存分析完成")
+
+inventory_ready = bool(st.session_state.get("_inventory_ready", False))
+
+if inventory_ready:
+    prod_all_for_export = st.session_state.get("_inv_prod_all", pd.DataFrame())
+    sku_all_for_export = st.session_state.get("_inv_sku_all")
+    render_overview_cards([
+        ("分析产品数", f"{len(prod_all_for_export):,}", "已识别并参与分析的产品"),
+        ("高风险产品", f"{len(prod_all_for_export[prod_all_for_export['风险等级'].isin(['极高风险', '高风险'])]):,}" if not prod_all_for_export.empty else "0", "极高风险和高风险产品"),
+        ("库存总金额", f"¥{prod_all_for_export['库存金额'].sum():,.0f}" if not prod_all_for_export.empty else "¥0", "全量库存资金占用"),
+        ("90天销量", f"{prod_all_for_export['90天内销量'].sum():,}" if not prod_all_for_export.empty else "0", "全部产品近 90 天销量"),
+    ])
+    export_data = build_full_export(
+        prod_all_for_export,
+        sku_all_for_export,
+        st.session_state.get("_inv_col_sku"),
+        st.session_state.get("_inv_col_amount"),
+    )
     st.download_button(
         label="下载 V5.3 完整决策 Excel",
         data=export_data,
         file_name="V5.3_库存决策系统.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
-
-    # 存入 session_state 供 tabs 使用
-    st.session_state["_inv_prod_lw"] = prod_lw
-    st.session_state["_inv_prod_dt"] = prod_dt
-    st.session_state["_inv_prod_all"] = prod_all
-    st.session_state["_inv_sku_lw"] = sku_lw
-    st.session_state["_inv_sku_dt"] = sku_dt
-    st.session_state["_inv_sku_all"] = sku_all
-    st.session_state["_inv_col_sku"] = col_sku
-    st.session_state["_inv_col_amount"] = col_amount
-    st.session_state["_inv_col_create"] = bool(col_create)
-    inventory_ready = True
 
 # ---- 7 个顶层 Tab（始终显示） ----
 t1, t2, t3, t4, t5, t6, t7 = st.tabs([

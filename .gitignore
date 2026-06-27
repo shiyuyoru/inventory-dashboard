@@ -2,3 +2,5 @@
 __pycache__/
 *.pyc
 .streamlit/
+app_v5_backup.py
+*_backup.py
