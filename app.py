@@ -4,12 +4,12 @@ import re
 import io
 import plotly.express as px
 from io import BytesIO
-from sea_freight import render_sea_freight_tab
+from sea_freight import render_combo_analysis_tab, render_sea_freight_tab
 
 # ============================================================
 # PAGE CONFIG & STYLE
 # ============================================================
-st.set_page_config(page_title="库存决策系统 V5.3", layout="wide")
+st.set_page_config(page_title="Hunthouse & D1", layout="wide")
 st.markdown("""
 <style>
   :root {
@@ -62,7 +62,8 @@ st.markdown("""
   }
 </style>
 """, unsafe_allow_html=True)
-st.title("库存决策系统 V5.3")
+st.title("Hunthouse & D1")
+st.caption("v5.3")
 
 # ============================================================
 # CONSTANTS
@@ -102,6 +103,20 @@ BADGE_COLORS = {
     "死库存": ("#f1f5f9", "#475569"),
     "新品池": ("#e0f2fe", "#0369a1"),
 }
+
+BRAND_DISPLAY = {
+    "LW": "Hunthouse(LW)",
+    "DT": "D1",
+}
+
+
+def display_brand(value):
+    return BRAND_DISPLAY.get(str(value), value)
+
+
+def strip_status_icon(value):
+    text = str(value)
+    return re.sub(r"^[^\w\u4e00-\u9fff]+\s*", "", text)
 
 
 def render_overview_cards(items):
@@ -323,13 +338,15 @@ def aggregate_and_enrich(df_brand, col_sku, col_amount):
 # ⑥ 图表
 # ============================================================
 def make_pie(labels, values, title, color_map):
-    df_pie = pd.DataFrame({"等级": labels, "数量": values})
+    display_labels = [strip_status_icon(label) for label in labels]
+    display_color_map = {strip_status_icon(k): v for k, v in color_map.items()}
+    df_pie = pd.DataFrame({"等级": display_labels, "数量": values})
     df_pie = df_pie[df_pie["数量"] > 0]
     if df_pie.empty:
         return None
     fig = px.pie(
         df_pie, names="等级", values="数量", color="等级",
-        color_discrete_map=color_map, category_orders={"等级": list(color_map.keys())}, hole=0.4,
+        color_discrete_map=display_color_map, category_orders={"等级": list(display_color_map.keys())}, hole=0.4,
     )
     fig.update_traces(
         textposition="inside", textinfo="percent", textfont_size=12,
@@ -349,6 +366,11 @@ def show_table(df, cols, sort_by=None, ascending=False):
     if sort_by and sort_by in df.columns:
         df = df.sort_values(sort_by, ascending=ascending)
     display_df = df[avail].copy()
+    if "品牌" in display_df.columns:
+        display_df["品牌"] = display_df["品牌"].apply(display_brand)
+    for c in ["产品分类", "销售动作", "处理建议"]:
+        if c in display_df.columns:
+            display_df[c] = display_df[c].apply(strip_status_icon)
     for c in ["处理建议", "推荐理由"]:
         if c in display_df.columns:
             display_df[c] = display_df[c].apply(_truncate_text)
@@ -358,7 +380,7 @@ def show_table(df, cols, sort_by=None, ascending=False):
 # ⑦ 渲染：库存分析（保留原有饼图+折叠表）
 # ============================================================
 def render_analysis(prod, sku, col_sku, col_amount, brand):
-    st.header(brand)
+    st.header(display_brand(brand))
     if prod.empty:
         st.info("无该品牌产品")
         return
@@ -428,7 +450,7 @@ def render_analysis(prod, sku, col_sku, col_amount, brand):
 # ⑧ 渲染：新品池
 # ============================================================
 def render_new_products(prod, sku, col_sku, col_amount, has_create_time):
-    st.header("🆕 新品池")
+    st.header("新品监控")
     if not has_create_time:
         st.info("未检测到「创建时间」列，无法识别新品。新品池暂为空。")
         return
@@ -455,7 +477,7 @@ def render_new_products(prod, sku, col_sku, col_amount, has_create_time):
 # ⑨ 渲染：清仓清单
 # ============================================================
 def render_clearance(prod, sku, col_sku, col_amount):
-    st.header("🗑️ 清仓清单")
+    st.header("清仓清单")
     p_clear = prod[prod["销售动作"].isin(["🟥 清仓（停广告+降价）", "🟥 强清仓"])]
     p_clear = p_clear.sort_values("清仓评分", ascending=False)
     render_overview_cards([
@@ -483,7 +505,7 @@ def render_clearance(prod, sku, col_sku, col_amount):
 # ⑩ 渲染：放量清单
 # ============================================================
 def render_scaleup(prod, sku, col_sku, col_amount):
-    st.header("📈 放量清单")
+    st.header("放量清单")
     p_scale = prod[prod["销售动作"].isin(["🟩 扩量", "🟧 放量"])]
     p_scale = p_scale.sort_values("90天内销量", ascending=False)
     render_overview_cards([
@@ -511,7 +533,7 @@ def render_scaleup(prod, sku, col_sku, col_amount):
 # ⑪ 渲染：风险清单
 # ============================================================
 def render_risk(prod, sku, col_sku, col_amount):
-    st.header("⚠️ 风险清单")
+    st.header("风险清单")
     p_risk = prod[prod["风险等级"].isin(["极高风险", "高风险", "中风险"])]
     risk_order = {"极高风险": 0, "高风险": 1, "中风险": 2}
     p_risk["_r"] = p_risk["风险等级"].map(risk_order)
@@ -542,7 +564,7 @@ def render_risk(prod, sku, col_sku, col_amount):
 # ⑫ 渲染：领导决策清单
 # ============================================================
 def render_leader(prod, sku, col_sku, col_amount):
-    st.header("💰 领导决策清单")
+    st.header("领导决策清单")
     st.caption("按优先级评分从高到低排列。评分 = 库存金额 ÷ (90天销量 + 1)，资金占用越严重、销量越低，评分越高。")
 
     # 统计卡片
@@ -617,117 +639,160 @@ def build_full_export(prod_all, sku_all, col_sku, col_amount):
 # ============================================================
 # ⑭ 主流程
 # ============================================================
-file = st.file_uploader("上传库存 Excel 文件", type=["xlsx"], key="inventory_upload")
+def analyze_inventory_file(file):
+    df, col_sku, col_amount, col_price, col_create, filtered = load_data(file.getvalue())
+    if filtered:
+        st.caption(f"已过滤 {filtered} 行无法识别为 LW/DT 产品的数据")
+    if not col_price:
+        st.caption("未识别到「单价」列，库存金额由总价列推算")
+    if not col_create:
+        st.caption("未识别到「创建时间」列，新品监控暂不可用")
 
-if file:
-    file_id = f"{file.name}:{getattr(file, 'size', 0)}"
-    if st.session_state.get("_inventory_file_id") != file_id:
-        st.session_state["_inventory_ready"] = False
-        st.session_state["_inventory_file_id"] = file_id
+    results = {}
+    for brand in ["LW", "DT"]:
+        df_b = df[df["品牌"] == brand].copy()
+        results[brand] = (pd.DataFrame(), None) if df_b.empty else aggregate_and_enrich(df_b, col_sku, col_amount)
 
-    st.caption(f"已选择文件：{file.name}。点击下方按钮后开始计算库存分析。")
-    if st.button("开始分析库存数据", type="primary", use_container_width=True):
-        with st.spinner("正在分析库存数据..."):
-            df, col_sku, col_amount, col_price, col_create, filtered = load_data(file.getvalue())
-            if filtered:
-                st.caption(f"已过滤 {filtered} 行无法识别为 LW/DT 产品的数据")
-            if not col_price:
-                st.caption("未识别到「单价」列，库存金额由总价列推算")
-            if not col_create:
-                st.caption("未识别到「创建时间」列，新品池暂不可用")
+    prod_lw, sku_lw = results["LW"]
+    prod_dt, sku_dt = results["DT"]
 
-            # ---- 按品牌聚合 ----
-            results = {}
-            for brand in ["LW", "DT"]:
-                df_b = df[df["品牌"] == brand].copy()
-                if df_b.empty:
-                    results[brand] = (pd.DataFrame(), None)
-                else:
-                    results[brand] = aggregate_and_enrich(df_b, col_sku, col_amount)
+    prod_frames = []
+    for brand, prod in [("LW", prod_lw), ("DT", prod_dt)]:
+        if not prod.empty:
+            tagged = prod.copy()
+            tagged["品牌"] = brand
+            prod_frames.append(tagged)
+    prod_all = pd.concat(prod_frames, ignore_index=True) if prod_frames else pd.DataFrame()
 
-            prod_lw, sku_lw = results["LW"]
-            prod_dt, sku_dt = results["DT"]
+    sku_frames = []
+    for brand, sku_df in [("LW", sku_lw), ("DT", sku_dt)]:
+        if sku_df is not None and not sku_df.empty:
+            tagged = sku_df.copy()
+            tagged["品牌"] = brand
+            sku_frames.append(tagged)
+    sku_all = pd.concat(sku_frames, ignore_index=True) if sku_frames else None
 
-            # ---- 合并（带品牌字段） ----
-            prod_lw_tag = prod_lw.copy(); prod_lw_tag["品牌"] = "LW"
-            prod_dt_tag = prod_dt.copy(); prod_dt_tag["品牌"] = "DT"
-            prod_all = pd.concat([prod_lw_tag, prod_dt_tag], ignore_index=True) if not prod_lw.empty or not prod_dt.empty else prod_lw_tag
+    st.session_state["_inv_prod_lw"] = prod_lw
+    st.session_state["_inv_prod_dt"] = prod_dt
+    st.session_state["_inv_prod_all"] = prod_all
+    st.session_state["_inv_sku_lw"] = sku_lw
+    st.session_state["_inv_sku_dt"] = sku_dt
+    st.session_state["_inv_sku_all"] = sku_all
+    st.session_state["_inv_col_sku"] = col_sku
+    st.session_state["_inv_col_amount"] = col_amount
+    st.session_state["_inv_col_create"] = bool(col_create)
+    st.session_state["_inventory_ready"] = True
 
-            sku_all = None
-            if sku_lw is not None and sku_dt is not None:
-                sku_lw_tag = sku_lw.copy(); sku_lw_tag["品牌"] = "LW"
-                sku_dt_tag = sku_dt.copy(); sku_dt_tag["品牌"] = "DT"
-                sku_all = pd.concat([sku_lw_tag, sku_dt_tag], ignore_index=True)
 
-            # 存入 session_state 供 tabs 使用
-            st.session_state["_inv_prod_lw"] = prod_lw
-            st.session_state["_inv_prod_dt"] = prod_dt
-            st.session_state["_inv_prod_all"] = prod_all
-            st.session_state["_inv_sku_lw"] = sku_lw
-            st.session_state["_inv_sku_dt"] = sku_dt
-            st.session_state["_inv_sku_all"] = sku_all
-            st.session_state["_inv_col_sku"] = col_sku
-            st.session_state["_inv_col_amount"] = col_amount
-            st.session_state["_inv_col_create"] = bool(col_create)
-            st.session_state["_inventory_ready"] = True
-        st.success("库存分析完成")
+def render_inventory_upload(key_suffix):
+    uploaded = st.file_uploader("上传库存表", type=["xlsx"], key=f"inventory_upload_{key_suffix}")
+    if st.session_state.get("_inventory_ready"):
+        st.caption("已读取库存表，可重新上传。")
+    else:
+        st.caption("上传库存表后点击按钮开始分析。")
+    if uploaded:
+        file_id = f"{uploaded.name}:{getattr(uploaded, 'size', 0)}"
+        if st.session_state.get("_inventory_file_id") != file_id:
+            st.session_state["_inventory_ready"] = False
+            st.session_state["_inventory_file_id"] = file_id
+        if st.button("开始分析库存数据", type="primary", use_container_width=True, key=f"analyze_inventory_{key_suffix}"):
+            with st.spinner("正在分析库存数据..."):
+                analyze_inventory_file(uploaded)
+            st.success("库存分析完成")
 
-inventory_ready = bool(st.session_state.get("_inventory_ready", False))
 
-if inventory_ready:
-    prod_all_for_export = st.session_state.get("_inv_prod_all", pd.DataFrame())
-    sku_all_for_export = st.session_state.get("_inv_sku_all")
+def filter_brand_df(df, brand):
+    if df is None or df.empty or brand == "ALL":
+        return df
+    return df[df["品牌"] == brand].copy() if "品牌" in df.columns else df
+
+
+def mature_inventory(df):
+    if df is None or df.empty or "产品分类" not in df.columns:
+        return df
+    return df[df["产品分类"] != "🆕 新品池"].copy()
+
+
+def render_stock_health_tab():
+    st.header("库存健康")
+    render_inventory_upload("health")
+    if not st.session_state.get("_inventory_ready"):
+        st.info("请先上传库存表并点击开始分析。")
+        return
+
+    prod_all = mature_inventory(st.session_state.get("_inv_prod_all", pd.DataFrame()))
+    sku_all = mature_inventory(st.session_state.get("_inv_sku_all"))
+    col_sku = st.session_state.get("_inv_col_sku")
+    col_amount = st.session_state.get("_inv_col_amount")
+
     render_overview_cards([
-        ("分析产品数", f"{len(prod_all_for_export):,}", "已识别并参与分析的产品"),
-        ("高风险产品", f"{len(prod_all_for_export[prod_all_for_export['风险等级'].isin(['极高风险', '高风险'])]):,}" if not prod_all_for_export.empty else "0", "极高风险和高风险产品"),
-        ("库存总金额", f"¥{prod_all_for_export['库存金额'].sum():,.0f}" if not prod_all_for_export.empty else "¥0", "全量库存资金占用"),
-        ("90天销量", f"{prod_all_for_export['90天内销量'].sum():,}" if not prod_all_for_export.empty else "0", "全部产品近 90 天销量"),
+        ("成熟产品数", f"{len(prod_all):,}", "已排除 90 天内新品"),
+        ("高风险产品", f"{len(prod_all[prod_all['风险等级'].isin(['极高风险', '高风险'])]):,}" if not prod_all.empty else "0", "极高风险和高风险产品"),
+        ("库存总金额", f"¥{prod_all['库存金额'].sum():,.0f}" if not prod_all.empty else "¥0", "成熟库存资金占用"),
+        ("90天销量", f"{prod_all['90天内销量'].sum():,}" if not prod_all.empty else "0", "成熟库存近 90 天销量"),
     ])
-    export_data = build_full_export(
-        prod_all_for_export,
-        sku_all_for_export,
+
+    brand_tabs = st.tabs(["全部", "Hunthouse(LW)", "D1"])
+    for tab, brand, label in zip(brand_tabs, ["ALL", "LW", "DT"], ["全部", "LW", "DT"]):
+        with tab:
+            p = filter_brand_df(prod_all, brand)
+            s = filter_brand_df(sku_all, brand)
+            if p is None or p.empty:
+                st.info("当前品牌暂无成熟库存数据。")
+                continue
+            render_analysis(p, s, col_sku, col_amount, label)
+            with st.expander("清仓建议", expanded=False):
+                render_clearance(p, s, col_sku, col_amount)
+            with st.expander("放量机会", expanded=False):
+                render_scaleup(p, s, col_sku, col_amount)
+            with st.expander("库存风险", expanded=False):
+                render_risk(p, s, col_sku, col_amount)
+            with st.expander("领导决策清单", expanded=False):
+                render_leader(p, s, col_sku, col_amount)
+
+    export_data = build_full_export(prod_all, sku_all, col_sku, col_amount)
+    st.download_button(
+        label="下载库存健康 Excel",
+        data=export_data,
+        file_name="库存健康_成熟库存.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+
+
+def render_new_monitor_tab():
+    st.header("新品监控")
+    render_inventory_upload("new")
+    if not st.session_state.get("_inventory_ready"):
+        st.info("请先上传库存表并点击开始分析。若已在库存健康上传，可直接复用。")
+        return
+
+    prod_all = st.session_state.get("_inv_prod_all", pd.DataFrame())
+    sku_all = st.session_state.get("_inv_sku_all")
+    brand_choice = st.selectbox(
+        "品牌",
+        options=["ALL", "LW", "DT"],
+        format_func=lambda x: "全部" if x == "ALL" else display_brand(x),
+        index=0,
+    )
+    p = filter_brand_df(prod_all, brand_choice)
+    s = filter_brand_df(sku_all, brand_choice)
+    render_new_products(
+        p,
+        s,
         st.session_state.get("_inv_col_sku"),
         st.session_state.get("_inv_col_amount"),
-    )
-    st.download_button(
-        label="下载 V5.3 完整决策 Excel",
-        data=export_data,
-        file_name="V5.3_库存决策系统.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        st.session_state.get("_inv_col_create"),
     )
 
-# ---- 7 个顶层 Tab（始终显示） ----
-t1, t2, t3, t4, t5, t6, t7 = st.tabs([
-    "📊 库存分析", "🆕 新品池", "🗑️ 清仓清单",
-    "📈 放量清单", "⚠️ 风险清单", "💰 领导决策清单",
-    "🚢 法国/意大利海托分析",
-])
 
-_inv = lambda k: st.session_state.get(k)
+t1, t2, t3, t4 = st.tabs(["库存健康", "新品监控", "意法海托", "组合分析"])
 
 with t1:
-    if not inventory_ready:
-        st.info("📂 请先在上方上传库存 Excel 文件")
-    else:
-        sub_lw, sub_dt = st.tabs(["LW", "DT"])
-        with sub_lw:
-            render_analysis(_inv("_inv_prod_lw"), _inv("_inv_sku_lw"), _inv("_inv_col_sku"), _inv("_inv_col_amount"), "LW")
-        with sub_dt:
-            render_analysis(_inv("_inv_prod_dt"), _inv("_inv_sku_dt"), _inv("_inv_col_sku"), _inv("_inv_col_amount"), "DT")
+    render_stock_health_tab()
 with t2:
-    if not inventory_ready: st.info("📂 请先在上方上传库存 Excel 文件")
-    else: render_new_products(_inv("_inv_prod_all"), _inv("_inv_sku_all"), _inv("_inv_col_sku"), _inv("_inv_col_amount"), _inv("_inv_col_create"))
+    render_new_monitor_tab()
 with t3:
-    if not inventory_ready: st.info("📂 请先在上方上传库存 Excel 文件")
-    else: render_clearance(_inv("_inv_prod_all"), _inv("_inv_sku_all"), _inv("_inv_col_sku"), _inv("_inv_col_amount"))
-with t4:
-    if not inventory_ready: st.info("📂 请先在上方上传库存 Excel 文件")
-    else: render_scaleup(_inv("_inv_prod_all"), _inv("_inv_sku_all"), _inv("_inv_col_sku"), _inv("_inv_col_amount"))
-with t5:
-    if not inventory_ready: st.info("📂 请先在上方上传库存 Excel 文件")
-    else: render_risk(_inv("_inv_prod_all"), _inv("_inv_sku_all"), _inv("_inv_col_sku"), _inv("_inv_col_amount"))
-with t6:
-    if not inventory_ready: st.info("📂 请先在上方上传库存 Excel 文件")
-    else: render_leader(_inv("_inv_prod_all"), _inv("_inv_sku_all"), _inv("_inv_col_sku"), _inv("_inv_col_amount"))
-with t7:
     render_sea_freight_tab()
+with t4:
+    render_combo_analysis_tab()
