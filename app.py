@@ -145,7 +145,10 @@ def style_dataframe(df):
         styler = styler.format({c: _format_value for c in numeric_cols})
         styler = styler.set_properties(subset=numeric_cols, **{"text-align": "right"})
     if badge_cols:
-        styler = styler.applymap(badge_style, subset=badge_cols)
+        if hasattr(styler, "map"):
+            styler = styler.map(badge_style, subset=badge_cols)
+        else:
+            styler = styler.applymap(badge_style, subset=badge_cols)
     return styler
 
 # ============================================================
