@@ -1680,24 +1680,26 @@ def render_product_combo_generator(orders, prod_df, module_key, cache_prefix,
     product = (product_input or selected_product or "").strip().upper()
     excluded_from_select = []
     manual_excluded = []
+    color_options = get_product_color_options(orders, product) if product else []
+    exclude_cols = st.columns([1.6, 1.1])
+    with exclude_cols[0]:
+        excluded_from_select = st.multiselect(
+            "排除色号",
+            options=color_options,
+            placeholder="请先选择产品型号" if not product else "选择不参与组合的色号",
+            disabled=not bool(product),
+            key=f"{module_key}_excluded_colors",
+        )
+    with exclude_cols[1]:
+        excluded_text = st.text_input(
+            "手动输入排除色号",
+            value="",
+            placeholder="例如 001,014,019",
+            disabled=not bool(product),
+            key=f"{module_key}_excluded_text",
+        )
+        manual_excluded = parse_excluded_colors(excluded_text) if product else []
     if product:
-        color_options = get_product_color_options(orders, product)
-        exclude_cols = st.columns([1.6, 1.1])
-        with exclude_cols[0]:
-            excluded_from_select = st.multiselect(
-                "排除色号",
-                options=color_options,
-                placeholder="选择不参与组合的色号",
-                key=f"{module_key}_excluded_colors",
-            )
-        with exclude_cols[1]:
-            excluded_text = st.text_input(
-                "手动输入排除色号",
-                value="",
-                placeholder="例如 001,014,019",
-                key=f"{module_key}_excluded_text",
-            )
-            manual_excluded = parse_excluded_colors(excluded_text)
         if not color_options:
             st.caption("当前产品暂无可识别的 001-030 色号。")
     else:
