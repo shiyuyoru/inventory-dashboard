@@ -1110,19 +1110,27 @@ def _combo_note(ctype, tier_counts, has_top1):
 
 def generate_product_combos(orders, recommended_sizes, color_scores,
                             combo_size=3, max_combos=6, co_purchase_df=None,
-                            allow_color_repeat=True):
+                            allow_color_repeat=True, excluded_colors=None):
     """均衡铺货优先：热卖色、稳定色、弱色分层生成组合，并控制颜色重复。"""
     if orders.empty or recommended_sizes.empty or color_scores.empty:
         return {}, pd.DataFrame()
     if co_purchase_df is None:
         co_purchase_df = pd.DataFrame()
+    excluded_colors = {
+        normalize_valid_color(c)
+        for c in (excluded_colors or [])
+        if normalize_valid_color(c)
+    }
 
     product_combos_preview = {}
     all_combo_rows = []
 
     for prod in recommended_sizes["产品型号"].unique():
-        prod_colors = color_scores[color_scores["产品型号"] == prod]
+        prod_colors = color_scores[color_scores["产品型号"] == prod].copy()
+        prod_colors["色号"] = prod_colors["色号"].apply(normalize_color)
         prod_colors = prod_colors[prod_colors["色号"].apply(is_valid_normalized_color)]
+        if excluded_colors:
+            prod_colors = prod_colors[~prod_colors["色号"].isin(excluded_colors)]
         if len(prod_colors) < 2: continue
 
         prod_sizes = recommended_sizes[
@@ -1140,7 +1148,9 @@ def generate_product_combos(orders, recommended_sizes, color_scores,
             for _, r in cp.iterrows():
                 a = normalize_color(r["色号A"])
                 b = normalize_color(r["色号B"])
-                if a and b:
+                if a and b and is_valid_normalized_color(a) and is_valid_normalized_color(b):
+                    if a in excluded_colors or b in excluded_colors:
+                        continue
                     key = (min(a, b), max(a, b))
                     co_purchase_map[key] = co_purchase_map.get(key, 0) + r["共购分"]
 
@@ -1164,6 +1174,10 @@ def generate_product_combos(orders, recommended_sizes, color_scores,
             (orders["_color"] != "")
         ].copy()
         prod_rec_orders["_color"] = prod_rec_orders["_color"].apply(normalize_color)
+        prod_rec_orders = prod_rec_orders[
+            prod_rec_orders["_color"].apply(is_valid_normalized_color) &
+            ~prod_rec_orders["_color"].isin(excluded_colors)
+        ]
         color_sizes_map = {
             c: set(g["_size"].dropna().tolist())
             for c, g in prod_rec_orders.groupby("_color")
@@ -1174,6 +1188,10 @@ def generate_product_combos(orders, recommended_sizes, color_scores,
         def add_candidate(combo, ctype):
             key = _combo_key(combo)
             if len(key) != combo_size:
+                return
+            if any(c in excluded_colors for c in key):
+                return
+            if any(not is_valid_normalized_color(c) for c in key):
                 return
             if any(color_sales_map.get(c, 0) <= 0 for c in key):
                 return
@@ -1511,11 +1529,42 @@ def get_product_options(prod_df):
     return prod_df["产品型号"].dropna().astype(str).sort_values().tolist()
 
 
+def parse_excluded_colors(text):
+    if not text:
+        return []
+    colors = []
+    for token in re.split(r"[\s,，、/;+]+", str(text)):
+        color = normalize_valid_color(token)
+        if color:
+            colors.append(color)
+    return sorted(set(colors))
+
+
+def get_product_color_options(orders, product):
+    if orders.empty or not product or "_product" not in orders.columns or "_color" not in orders.columns:
+        return []
+    product = str(product).strip().upper()
+    colors = (
+        orders.loc[orders["_product"] == product, "_color"]
+        .dropna()
+        .astype(str)
+        .map(normalize_color)
+    )
+    return sorted({c for c in colors if is_valid_normalized_color(c)})
+
+
 def generate_single_product_result(orders, product, min_sales, max_combos, allow_repeat,
-                                   size_scope, cache_prefix, force_combo_size=None, cache_context=""):
+                                   size_scope, cache_prefix, force_combo_size=None, cache_context="",
+                                   excluded_colors=None):
     product = product.strip().upper()
     if not product:
         return None
+    excluded_colors = sorted({
+        normalize_valid_color(c)
+        for c in (excluded_colors or [])
+        if normalize_valid_color(c)
+    })
+    excluded_key = ",".join(excluded_colors)
 
     size_df = size_analysis(orders, min_sales)
     prod_size_df = size_df[size_df["产品型号"] == product].copy() if not size_df.empty else pd.DataFrame()
@@ -1536,8 +1585,8 @@ def generate_single_product_result(orders, product, min_sales, max_combos, allow
         combo_size = 3
 
     cache_key = (
-        f"{cache_prefix}_balanced_stock_v3_{product}_{min_sales}_{max_combos}_{allow_repeat}_"
-        f"{size_scope}_{combo_size}_{cache_context}_{','.join(rec_sizes)}"
+        f"{cache_prefix}_balanced_stock_v4_{product}_{min_sales}_{max_combos}_{allow_repeat}_"
+        f"{size_scope}_{combo_size}_{cache_context}_{','.join(rec_sizes)}_excluded_{excluded_key}"
     )
     if cache_key in st.session_state:
         return st.session_state[cache_key]
@@ -1548,10 +1597,16 @@ def generate_single_product_result(orders, product, min_sales, max_combos, allow
     co_purchase_df = build_co_purchase_table(prod_orders)
     _, combo_df = generate_product_combos(
         prod_orders, recommended_sizes, color_df, combo_size, max_combos, co_purchase_df,
-        allow_color_repeat=allow_repeat
+        allow_color_repeat=allow_repeat, excluded_colors=excluded_colors
     ) if not color_df.empty else ({}, pd.DataFrame())
 
     if not combo_df.empty:
+        if excluded_colors and "推荐组合色号" in combo_df.columns:
+            combo_df = combo_df[
+                ~combo_df["推荐组合色号"].astype(str).apply(
+                    lambda value: any(color in re.split(r"[、,，\s/]+", value) for color in excluded_colors)
+                )
+            ].copy()
         combo_df = combo_df.rename(columns={"推荐尺寸": "尺寸"})
         combo_df = combo_df[[
             "产品型号", "尺寸", "组合件数", "推荐组合色号", "组合类型",
@@ -1560,7 +1615,11 @@ def generate_single_product_result(orders, product, min_sales, max_combos, allow
     generated_count = len(combo_df)
     shortage_note = ""
     if generated_count < int(max_combos):
-        shortage_note = f"有效候选不足，仅生成 {generated_count} 组。"
+        shortage_note = (
+            f"排除色号后有效候选不足，仅生成 {generated_count} 组。"
+            if excluded_colors else
+            f"有效候选不足，仅生成 {generated_count} 组。"
+        )
 
     product_row = product_analysis(prod_orders).head(1)
     product_row = add_risk_label(product_row)
@@ -1585,6 +1644,7 @@ def generate_single_product_result(orders, product, min_sales, max_combos, allow
         "shortage_note": shortage_note,
         "color_df": color_df,
         "shared_image": shared_image,
+        "excluded_colors": excluded_colors,
     }
     st.session_state[cache_key] = result
     return result
@@ -1617,6 +1677,33 @@ def render_product_combo_generator(orders, prod_df, module_key, cache_prefix,
         st.write("")
         generate_clicked = st.button("生成组合建议", type="primary", key=f"{module_key}_generate")
 
+    product = (product_input or selected_product or "").strip().upper()
+    excluded_from_select = []
+    manual_excluded = []
+    if product:
+        color_options = get_product_color_options(orders, product)
+        exclude_cols = st.columns([1.6, 1.1])
+        with exclude_cols[0]:
+            excluded_from_select = st.multiselect(
+                "排除色号",
+                options=color_options,
+                placeholder="选择不参与组合的色号",
+                key=f"{module_key}_excluded_colors",
+            )
+        with exclude_cols[1]:
+            excluded_text = st.text_input(
+                "手动输入排除色号",
+                value="",
+                placeholder="例如 001,014,019",
+                key=f"{module_key}_excluded_text",
+            )
+            manual_excluded = parse_excluded_colors(excluded_text)
+        if not color_options:
+            st.caption("当前产品暂无可识别的 001-030 色号。")
+    else:
+        st.caption("请先选择产品型号后再选择排除色号。")
+    excluded_colors = sorted(set(excluded_from_select) | set(manual_excluded))
+
     with st.expander("高级筛选", expanded=False):
         a1, a2, a3 = st.columns([0.8, 1.1, 0.9])
         with a1:
@@ -1627,13 +1714,12 @@ def render_product_combo_generator(orders, prod_df, module_key, cache_prefix,
             manual_combo_size = st.selectbox("组合件数", ["自动判断", 2, 3, 4, 5, 6], key=f"{module_key}_manual_combo_size")
         st.caption(f"当前数据范围：{default_country_label}。筛选条件只影响当前产品组合生成。")
 
-    product = (product_input or selected_product or "").strip().upper()
     if generate_clicked:
         force = None if manual_combo_size == "自动判断" else int(manual_combo_size)
         with st.spinner("正在生成单产品组合建议..."):
             result = generate_single_product_result(
                 orders, product, min_sales, max_combos, allow_repeat, size_scope,
-                cache_prefix, force, cache_context
+                cache_prefix, force, cache_context, excluded_colors=excluded_colors
             )
         st.session_state[f"{module_key}_last_result"] = result
 
@@ -1657,6 +1743,8 @@ def render_product_combo_generator(orders, prod_df, module_key, cache_prefix,
         f"共用图片：{result['shared_image']}"
     )
     st.markdown(f"<div class='combo-summary'>{summary}</div>", unsafe_allow_html=True)
+    excluded_status = "、".join(result.get("excluded_colors") or [])
+    st.caption(f"已排除色号：{excluded_status}" if excluded_status else "未排除色号")
     kpi_line = (
         f"法国销量 {fr_qty:,}｜意大利销量 {it_qty:,}｜总销量 {total_qty:,}｜"
         f"退款风险 {refund}｜主要购买尺寸 {' / '.join(result['recommended_sizes'][:3]) or '-'}｜{result['quantity_reason']}"
@@ -1670,6 +1758,8 @@ def render_product_combo_generator(orders, prod_df, module_key, cache_prefix,
         unsafe_allow_html=True,
     )
     if result["combo_df"].empty:
+        if result.get("shortage_note"):
+            st.warning(result["shortage_note"])
         st.warning("该产品暂无足够颜色或共购数据生成组合。")
     else:
         if result.get("shortage_note"):
