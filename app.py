@@ -4,6 +4,7 @@ import re
 import io
 import plotly.express as px
 from io import BytesIO
+from config import APP_VERSION
 from sea_freight import render_combo_analysis_tab, render_sea_freight_tab
 
 # ============================================================
@@ -63,7 +64,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 st.title("Hunthouse & D1")
-st.caption("v5.3.01")
+st.caption(APP_VERSION)
 
 # ============================================================
 # CONSTANTS

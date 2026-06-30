@@ -6,8 +6,25 @@ import streamlit as st
 import pandas as pd
 import re
 import io
-import time
+import json
+import hashlib
 from itertools import combinations, combinations_with_replacement, product
+from config import (
+    COMBO_STRATEGY_WEIGHTS,
+    FORCED_WEAK_COLOR_RATIO,
+    HOT_COLOR_RATIO,
+    MAX_COLOR_POOL_BASE,
+    ORDER_CO_PURCHASE_WEIGHT,
+    PACKAGE_CO_PURCHASE_WEIGHT,
+    PRODUCT_RECOMMEND_NORMAL_SALES,
+    PRODUCT_RECOMMEND_STRONG_SALES,
+    PRODUCT_RECOMMEND_TEST_SALES,
+    REFUND_RISK_HIGH,
+    REFUND_RISK_LOW,
+    REFUND_RISK_MEDIUM,
+    STABLE_COLOR_RATIO,
+    WEAK_COLOR_MAX_RATIO_DIVISOR,
+)
 
 # ============================================================
 # 国家识别
@@ -129,7 +146,7 @@ def _split_digits_to_valid_colors(digits, expected_count=None):
     return best, False
 
 
-def parse_color_codes_from_spec(spec, product_name=None, sku=None, expected_count=None, known_colors=None):
+def parse_color_codes_from_spec(spec, product_name=None, sku=None, expected_count=None):
     """从颜色字段解析 001-030 色号；组合色号会拆成多个颜色。返回 (codes, needs_review)。"""
     field_value, has_color_field = _extract_color_field(spec)
     if not has_color_field:
@@ -245,9 +262,50 @@ BRAND_DISPLAY = {
     "DT": "D1",
 }
 
+COLUMN_ALIASES = {
+    "pay_time": ["付款时间"],
+    "order_time": ["下单时间"],
+    "country": ["收货人国家", "买家国家", "国家"],
+    "sku": ["SKU", "商品SKU", "商品编码"],
+    "qty": ["单个产品数量", "数量"],
+    "refund": ["退款金额"],
+    "product_name": ["产品名称"],
+    "store": ["店铺账号", "店铺", "账号"],
+    "spec": ["产品规格", "规格"],
+    "merch_sku": ["商品SKU", "商品编码"],
+    "order_id": ["订单号"],
+    "package_id": ["包裹号"],
+}
+
 
 def display_brand(value):
     return BRAND_DISPLAY.get(str(value), value)
+
+
+def find_column(df, field, required=False):
+    aliases = COLUMN_ALIASES.get(field, [field])
+    columns = list(df.columns)
+
+    for alias in aliases:
+        for col in columns:
+            if str(col).strip() == alias:
+                return col
+    for alias in aliases:
+        for col in columns:
+            text = str(col).strip()
+            if alias in text:
+                if field == "order_id" and "包裹" in text:
+                    continue
+                return col
+
+    if required:
+        message = f"订单表缺少必需字段：{field}（候选列名：{', '.join(aliases)}）"
+        try:
+            st.warning(message)
+        except Exception:
+            pass
+        raise ValueError(message)
+    return None
 
 
 def render_metric_cards(items):
@@ -389,15 +447,11 @@ def extract_product_from_sku(sku_val, store_account=""):
 # ============================================================
 # 数据加载 (cached)
 # ============================================================
-@st.cache_data(show_spinner=False)
-def load_orders(file_bytes):
-    df = pd.read_excel(io.BytesIO(file_bytes))
+def _load_orders_from_df(df):
     df.columns = df.columns.astype(str).str.strip()
 
-    time_col_pay = time_col_order = None
-    for c in df.columns:
-        if "付款时间" in c: time_col_pay = c
-        if "下单时间" in c: time_col_order = c
+    time_col_pay = find_column(df, "pay_time")
+    time_col_order = find_column(df, "order_time")
     time_col = time_col_pay or time_col_order
     if time_col_pay:
         df["_time"] = pd.to_datetime(df[time_col_pay], errors="coerce")
@@ -406,50 +460,37 @@ def load_orders(file_bytes):
     elif time_col_order:
         df["_time"] = pd.to_datetime(df[time_col_order], errors="coerce")
 
-    country_col = None
-    for c in df.columns:
-        if "收货人国家" in c: country_col = c; break
+    country_col = find_column(df, "country")
     if country_col:
         df["_is_fr"] = df[country_col].apply(is_france)
         df["_is_it"] = df[country_col].apply(is_italy)
     else:
         df["_is_fr"] = df["_is_it"] = False
 
-    sku_col = None
-    for c in df.columns:
-        if c.strip() == "SKU": sku_col = c; break
-    if not sku_col:
-        for c in df.columns:
-            if "商品SKU" in c or "商品编码" in c: sku_col = c; break
+    sku_col = find_column(df, "sku")
     if not sku_col: sku_col = "SKU"; df[sku_col] = ""
 
-    qty_col = None
-    for c in df.columns:
-        if "单个产品数量" in c: qty_col = c; break
+    qty_col = find_column(df, "qty")
 
-    refund_col = None
-    for c in df.columns:
-        if "退款金额" in c: refund_col = c; break
+    refund_col = find_column(df, "refund")
     if refund_col:
         df[refund_col] = pd.to_numeric(df[refund_col], errors="coerce").fillna(0)
 
-    name_col = None
-    for c in df.columns:
-        if "产品名称" in c: name_col = c; break
+    name_col = find_column(df, "product_name")
 
-    store_col = None
-    for c in df.columns:
-        if "店铺账号" in c or "店铺" in c or "账号" in c: store_col = c; break
+    store_col = find_column(df, "store")
 
-    spec_col = None
-    for c in df.columns:
-        if "产品规格" in c or "规格" in c: spec_col = c; break
+    spec_col = find_column(df, "spec")
 
-    merch_sku_col = None
-    for c in df.columns:
-        if "商品SKU" in c or "商品编码" in c: merch_sku_col = c; break
+    merch_sku_col = find_column(df, "merch_sku")
 
     return df, sku_col, qty_col, refund_col, country_col, time_col, name_col, store_col, spec_col, merch_sku_col
+
+
+@st.cache_data(show_spinner=False)
+def load_orders(file_bytes):
+    df = pd.read_excel(io.BytesIO(file_bytes))
+    return _load_orders_from_df(df)
 
 
 # ============================================================
@@ -461,9 +502,19 @@ def prepare_orders(df, sku_col, qty_col, refund_col, country_col, name_col,
                    fr_only, it_only, min_date, max_date):
     """筛选法意订单，识别产品、尺寸、颜色。返回清洗后的 orders"""
     orders = df.copy()
+    if "_row_id" not in orders.columns:
+        orders["_row_id"] = range(len(orders))
 
     if "_time" in orders.columns:
-        orders = orders[(orders["_time"] >= min_date) & (orders["_time"] <= max_date)]
+        orders["_time"] = pd.to_datetime(orders["_time"], errors="coerce")
+        time_mask = orders["_time"].notna()
+        if min_date is not None:
+            start = pd.Timestamp(min_date)
+            time_mask &= orders["_time"] >= start
+        if max_date is not None:
+            end = pd.Timestamp(max_date) + pd.Timedelta(days=1)
+            time_mask &= orders["_time"] < end
+        orders = orders[time_mask].copy()
     if fr_only and it_only:
         orders = orders[orders["_is_fr"] | orders["_is_it"]]
     elif fr_only:
@@ -615,12 +666,12 @@ def prepare_orders(df, sku_col, qty_col, refund_col, country_col, name_col,
     orders["_refund_flag"] = orders["_has_refund"].astype(int)
 
     # ---- 订单号/包裹号 ----
-    for c in df.columns:
-        if "订单号" in str(c) and "包裹" not in str(c):
-            orders["_order"] = orders[c].astype(str); break
-    for c in df.columns:
-        if "包裹号" in str(c):
-            orders["_pkg"] = orders[c].astype(str); break
+    order_col = find_column(df, "order_id")
+    if order_col and order_col in orders.columns:
+        orders["_order"] = orders[order_col].astype(str)
+    package_col = find_column(df, "package_id")
+    if package_col and package_col in orders.columns:
+        orders["_pkg"] = orders[package_col].astype(str)
 
     # 组合包订单拆成多条颜色贡献；无色号订单保留但不进入颜色/共购推荐。
     orders["_colors"] = orders["_colors"].apply(lambda codes: codes if codes else [None])
@@ -634,6 +685,20 @@ def prepare_orders(df, sku_col, qty_col, refund_col, country_col, name_col,
 # ============================================================
 # 产品级分析 (cached)
 # ============================================================
+def _deduped_refund_rates(orders, group_cols, color_level=False):
+    if orders.empty or "_refund_flag" not in orders.columns:
+        return pd.DataFrame(columns=group_cols + ["refund_rate"])
+
+    dedupe_cols = list(group_cols)
+    if "_row_id" in orders.columns:
+        dedupe_cols.append("_row_id")
+    if color_level and "_color" in orders.columns and "_color" not in dedupe_cols:
+        dedupe_cols.append("_color")
+
+    base = orders.drop_duplicates(dedupe_cols).copy()
+    return base.groupby(group_cols)["_refund_flag"].mean().reset_index(name="refund_rate")
+
+
 @st.cache_data(show_spinner=False)
 def product_analysis(orders, product_combos=None):
     if orders.empty: return pd.DataFrame()
@@ -648,6 +713,14 @@ def product_analysis(orders, product_combos=None):
         n_pkgs=("_pkg", "nunique") if "_pkg" in orders else ("_qty", "sum"),
         month_cover=("_time", lambda x: x.dt.to_period("M").nunique()) if "_time" in orders else ("_qty", "sum"),
     ).reset_index()
+    refund_rates = _deduped_refund_rates(orders, ["_product"])
+    if not refund_rates.empty:
+        result = result.drop(columns=["refund_rate"]).merge(refund_rates, on="_product", how="left")
+        result["refund_rate"] = result["refund_rate"].fillna(0)
+    result = result[[
+        "_product", "FR_qty", "IT_qty", "total_qty", "n_orders", "n_sizes",
+        "n_colors", "refund_rate", "n_pkgs", "month_cover"
+    ]]
 
     result.columns = ["_product", "法国销量", "意大利销量", "总销量", "总订单数",
                        "有销量尺寸数", "有销量色号数", "退款风险", "包裹数", "月份覆盖数"]
@@ -655,9 +728,9 @@ def product_analysis(orders, product_combos=None):
         result[c] = result[c].fillna(0).astype(int)
 
     def recommend(row):
-        if row["总销量"] >= 100 and row["有销量尺寸数"] >= 2 and row["退款风险"] < 0.15: return "强烈推荐"
-        elif row["总销量"] >= 50: return "推荐"
-        elif row["总销量"] >= 20: return "可测试"
+        if row["总销量"] >= PRODUCT_RECOMMEND_STRONG_SALES and row["有销量尺寸数"] >= 2 and row["退款风险"] < REFUND_RISK_MEDIUM: return "强烈推荐"
+        elif row["总销量"] >= PRODUCT_RECOMMEND_NORMAL_SALES: return "推荐"
+        elif row["总销量"] >= PRODUCT_RECOMMEND_TEST_SALES: return "可测试"
         return "暂不推荐"
 
     result["品牌"] = result["_product"].apply(lambda x: x[:2])
@@ -691,6 +764,10 @@ def size_analysis(orders, min_total_sales=20):
         refund_rate=("_refund_flag", "mean"),
         month_cover=("_time", lambda x: x.dt.to_period("M").nunique()) if "_time" in orders else ("_qty", "sum"),
     ).reset_index()
+    refund_rates = _deduped_refund_rates(orders, ["_product", "_size"])
+    if not refund_rates.empty:
+        agg = agg.drop(columns=["refund_rate"]).merge(refund_rates, on=["_product", "_size"], how="left")
+        agg["refund_rate"] = agg["refund_rate"].fillna(0)
 
     agg = agg[agg["_size"].notna() & (agg["_size"] != "")]
     if agg.empty: return pd.DataFrame()
@@ -719,7 +796,7 @@ def size_analysis(orders, min_total_sales=20):
             (grp["n_colors"] / max_col) * 10 +
             grp.apply(lambda r: 10 if r["has_fr"] and r["has_it"] else (7 if r["has_fr"] else 5), axis=1) +
             (grp["month_cover"] / max_mo) * 5 -
-            grp["refund_rate"].apply(lambda r: 0 if r < 0.05 else (5 if r < 0.15 else (10 if r < 0.30 else 20)))
+            grp["refund_rate"].apply(lambda r: 0 if r < REFUND_RISK_LOW else (5 if r < REFUND_RISK_MEDIUM else (10 if r < REFUND_RISK_HIGH else 20)))
         ).clip(0, 100).round(1)
 
         grp = grp.sort_values("尺寸推荐分", ascending=False)
@@ -778,6 +855,10 @@ def color_analysis(orders, recommended_products, recommended_sizes):
         total_qty=("_qty", "sum"), n_orders=("_order", "nunique") if "_order" in merged else ("_qty", "sum"),
         n_sizes_covered=("_size", "nunique"), refund_rate=("_refund_flag", "mean"),
     ).reset_index()
+    refund_rates = _deduped_refund_rates(merged, ["_product", "_color"], color_level=True)
+    if not refund_rates.empty:
+        agg = agg.drop(columns=["refund_rate"]).merge(refund_rates, on=["_product", "_color"], how="left")
+        agg["refund_rate"] = agg["refund_rate"].fillna(0)
 
     agg["FR_sales"] = agg["FR_sales"].fillna(0).astype(int)
     agg["IT_sales"] = agg["IT_sales"].fillna(0).astype(int)
@@ -793,7 +874,7 @@ def color_analysis(orders, recommended_products, recommended_sizes):
             (grp["weighted"] / max_w) * 45 +
             (grp["n_sizes_covered"] / max_cov) * 20 +
             (grp["n_orders"] / max_ord) * 15 -
-            grp["refund_rate"].apply(lambda r: 0 if r < 0.05 else (5 if r < 0.15 else (10 if r < 0.30 else 20)))
+            grp["refund_rate"].apply(lambda r: 0 if r < REFUND_RISK_LOW else (5 if r < REFUND_RISK_MEDIUM else (10 if r < REFUND_RISK_HIGH else 20)))
         ).clip(0, 100).round(1)
         grp["共用图片"] = grp["n_sizes_covered"].apply(
             lambda n: "适合" if n >= 3 else ("有限" if n >= 2 else "单尺寸特化"))
@@ -846,7 +927,7 @@ def build_co_purchase_table(orders):
             sz = grp["_size"].iloc[0] if "_size" in grp.columns else ""
             for i in range(len(colors)):
                 for j in range(i+1, len(colors)):
-                    weight = 1.5 if is_pkg else 1.0
+                    weight = PACKAGE_CO_PURCHASE_WEIGHT if is_pkg else ORDER_CO_PURCHASE_WEIGHT
                     pairs.append((prod, sz, min(colors[i], colors[j]),
                                   max(colors[i], colors[j]), weight))
 
@@ -905,8 +986,8 @@ def _build_color_tiers(prod_colors, co_purchase_map):
     colors = colors.sort_values("_balanced_rank", ascending=False).reset_index(drop=True)
 
     n_colors = len(colors)
-    hot_cut = max(1, int(n_colors * 0.20 + 0.999))
-    stable_cut = max(hot_cut + 1, int(n_colors * 0.60 + 0.999))
+    hot_cut = max(1, int(n_colors * HOT_COLOR_RATIO + 0.999))
+    stable_cut = max(hot_cut + 1, int(n_colors * STABLE_COLOR_RATIO + 0.999))
     avg_sales = max(float(colors["总销量"].mean()), 1)
     score_q80 = float(colors["颜色推荐分"].quantile(0.80)) if n_colors > 1 else float(colors["颜色推荐分"].max())
 
@@ -923,7 +1004,7 @@ def _build_color_tiers(prod_colors, co_purchase_map):
 
     # 数据集中如果强弱分布不明显，也强制保留最低位颜色为弱色，用于色卡铺货测试。
     if "弱色" not in tier_map.values() and n_colors >= 3:
-        weak_n = max(1, int(n_colors * 0.20 + 0.999))
+        weak_n = max(1, int(n_colors * FORCED_WEAK_COLOR_RATIO + 0.999))
         for color in colors.tail(weak_n)["色号"]:
             if tier_map.get(color) != "热卖色":
                 tier_map[color] = "弱色"
@@ -998,11 +1079,7 @@ def _tier_choices(colors, count, allow_repeat, limit=80):
 
 
 def _combo_strategy_weights(strategy):
-    if strategy == "共购优先":
-        return {"sales": 0.25, "balance": 0.15, "co": 0.45, "weak": 0.05, "diff": 0.10}
-    if strategy == "销量转化优先":
-        return {"sales": 0.45, "balance": 0.10, "co": 0.30, "weak": 0.05, "diff": 0.10}
-    return {"sales": 0.20, "balance": 0.35, "co": 0.25, "weak": 0.10, "diff": 0.10}
+    return COMBO_STRATEGY_WEIGHTS.get(strategy, COMBO_STRATEGY_WEIGHTS["均衡铺货优先"])
 
 
 def _build_combo_evidence(prod_rec_orders):
@@ -1012,7 +1089,10 @@ def _build_combo_evidence(prod_rec_orders):
     if prod_rec_orders.empty:
         return pair_map, triple_map, group_size_counts
 
-    for group_cols, weight in [(["_order", "_product", "_size"], 1.0), (["_pkg", "_product", "_size"], 1.5)]:
+    for group_cols, weight in [
+        (["_order", "_product", "_size"], ORDER_CO_PURCHASE_WEIGHT),
+        (["_pkg", "_product", "_size"], PACKAGE_CO_PURCHASE_WEIGHT),
+    ]:
         group_id = group_cols[0]
         if group_id not in prod_rec_orders.columns:
             continue
@@ -1234,6 +1314,378 @@ def _combo_note(ctype, tier_counts, has_top1):
     return " ".join(notes)
 
 
+def _add_combo_candidate(candidates, combo, ctype, combo_size, excluded_colors,
+                         color_sales_map, allow_color_repeat, tier_map, priority=0):
+    key = _combo_key(combo)
+    if len(key) != combo_size:
+        return
+    if any(c in excluded_colors for c in key):
+        return
+    if any(not is_valid_normalized_color(c) for c in key):
+        return
+    if any(color_sales_map.get(c, 0) <= 0 for c in key):
+        return
+    if not allow_color_repeat and len(set(key)) < len(key):
+        return
+    if len(set(key)) == 1:
+        return
+    weak_count = sum(1 for c in key if tier_map.get(c) == "弱色")
+    anchor_count = sum(1 for c in key if tier_map.get(c) in ["热卖色", "稳定色"])
+    if weak_count == len(key) or (weak_count >= 2 and anchor_count == 0):
+        return
+    existing = candidates.get(key)
+    if not existing or priority > existing.get("priority", 0):
+        candidates[key] = {"combo": key, "base_type": ctype, "priority": priority}
+
+
+def add_balanced_candidates(candidates, combo_size, n, color_pool, tier_colors, tier_map,
+                            color_sales_map, excluded_colors, allow_color_repeat):
+    for ctype, pattern in _balanced_patterns(combo_size):
+        choice_groups = []
+        valid_pattern = True
+        for tier in ["热卖色", "稳定色", "弱色"]:
+            count = pattern.get(tier, 0)
+            colors = [c for c in tier_colors.get(tier, []) if c in color_pool]
+            choices = _tier_choices(colors, count, allow_color_repeat)
+            if not choices:
+                valid_pattern = False
+                break
+            choice_groups.append(choices)
+        if not valid_pattern:
+            continue
+        for parts in product(*choice_groups):
+            combo = []
+            for part in parts:
+                combo.extend(part)
+            _add_combo_candidate(
+                candidates, combo, ctype, combo_size, excluded_colors,
+                color_sales_map, allow_color_repeat, tier_map
+            )
+            if len(candidates) >= max(300, n * 60):
+                break
+
+
+def add_color_coverage_candidates(candidates, combo_size, n, color_pool, tier_map,
+                                  color_sales_map, excluded_colors, allow_color_repeat):
+    if combo_size > len(color_pool):
+        return
+    for combo in combinations(color_pool[:min(len(color_pool), MAX_COLOR_POOL_BASE)], combo_size):
+        tier_counts = {tier: sum(1 for c in combo if tier_map.get(c) == tier) for tier in ["热卖色", "稳定色", "弱色"]}
+        if tier_counts["弱色"] > max(1, combo_size // WEAK_COLOR_MAX_RATIO_DIVISOR):
+            continue
+        _add_combo_candidate(
+            candidates, combo, "色卡覆盖", combo_size, excluded_colors,
+            color_sales_map, allow_color_repeat, tier_map
+        )
+        if len(candidates) >= max(420, n * 80):
+            break
+
+
+def add_co_purchase_candidates(candidates, combo_size, n, color_pool, tier_map, color_score_map,
+                               color_sales_map, co_purchase_map, triple_map,
+                               excluded_colors, allow_color_repeat):
+    if not co_purchase_map:
+        return
+
+    co_pairs = sorted(co_purchase_map.items(), key=lambda x: x[1], reverse=True)
+    if combo_size == 2:
+        for (a, b), score in co_pairs[:max(20, n * 5)]:
+            if a in color_pool and b in color_pool and a != b:
+                _add_combo_candidate(candidates, [a, b], "共购组合", combo_size, excluded_colors,
+                                     color_sales_map, allow_color_repeat, tier_map, priority=6)
+
+    for (a, b), score in co_pairs[:max(28, n * 6)]:
+        if a in color_pool and b in color_pool and a != b:
+            partners = sorted(
+                [c for c in color_pool if c not in (a, b)],
+                key=lambda c: (
+                    8 if tier_map.get(c) == "弱色" else (5 if tier_map.get(c) == "稳定色" else 2),
+                    co_purchase_map.get((min(a, c), max(a, c)), 0) +
+                    co_purchase_map.get((min(b, c), max(b, c)), 0),
+                    color_score_map.get(c, 0)
+                ),
+                reverse=True,
+            )
+            base = [a, b] + partners[:max(combo_size - 2, 0)]
+            if len(base) == combo_size:
+                _add_combo_candidate(candidates, base, "共购组合", combo_size, excluded_colors,
+                                     color_sales_map, allow_color_repeat, tier_map, priority=4)
+
+    if combo_size >= 3 and triple_map:
+        co_triples = sorted(triple_map.items(), key=lambda x: x[1], reverse=True)
+        for triple, score in co_triples[:max(20, n * 4)]:
+            if all(c in color_pool for c in triple):
+                if combo_size == 3:
+                    _add_combo_candidate(candidates, list(triple), "共购组合", combo_size, excluded_colors,
+                                         color_sales_map, allow_color_repeat, tier_map, priority=7)
+                else:
+                    partners = sorted(
+                        [c for c in color_pool if c not in triple],
+                        key=lambda c: (
+                            9 if tier_map.get(c) == "弱色" else (6 if tier_map.get(c) == "稳定色" else 2),
+                            sum(co_purchase_map.get((min(c, t), max(c, t)), 0) for t in triple),
+                            -color_score_map.get(c, 0) if tier_map.get(c) == "热卖色" else color_score_map.get(c, 0),
+                        ),
+                        reverse=True,
+                    )
+                    base = list(triple) + partners[:combo_size - 3]
+                    if len(base) == combo_size:
+                        _add_combo_candidate(
+                            candidates, base, "3+1带货" if combo_size == 4 else "共购组合",
+                            combo_size, excluded_colors, color_sales_map, allow_color_repeat,
+                            tier_map, priority=8
+                        )
+
+    if combo_size == 4:
+        top_pairs = [(pair, score) for pair, score in co_pairs[:max(24, n * 6)] if pair[0] in color_pool and pair[1] in color_pool]
+        for idx, (pair1, score1) in enumerate(top_pairs):
+            for pair2, score2 in top_pairs[idx + 1:]:
+                if set(pair1) & set(pair2):
+                    continue
+                _add_combo_candidate(candidates, list(pair1 + pair2), "2+2共购", combo_size, excluded_colors,
+                                     color_sales_map, allow_color_repeat, tier_map, priority=10)
+                if len([c for c in candidates.values() if c["base_type"] == "2+2共购"]) >= max(8, n * 2):
+                    break
+            if len([c for c in candidates.values() if c["base_type"] == "2+2共购"]) >= max(8, n * 2):
+                break
+
+        for (a, b), score in co_pairs[:max(MAX_COLOR_POOL_BASE, n * 4)]:
+            if a not in color_pool or b not in color_pool:
+                continue
+            core_candidates = sorted(
+                [c for c in color_pool if c not in (a, b)],
+                key=lambda c: (
+                    8 if tier_map.get(c) == "稳定色" else (5 if tier_map.get(c) == "热卖色" else 4),
+                    co_purchase_map.get((min(a, c), max(a, c)), 0) +
+                    co_purchase_map.get((min(b, c), max(b, c)), 0),
+                    color_score_map.get(c, 0),
+                ),
+                reverse=True,
+            )
+            for core_c in core_candidates[:4]:
+                carriers = sorted(
+                    [c for c in color_pool if c not in (a, b, core_c)],
+                    key=lambda c: (
+                        10 if tier_map.get(c) == "弱色" else (7 if tier_map.get(c) == "稳定色" else 2),
+                        -color_score_map.get(c, 0),
+                    ),
+                    reverse=True,
+                )
+                if carriers:
+                    _add_combo_candidate(candidates, [a, b, core_c, carriers[0]], "3+1带货",
+                                         combo_size, excluded_colors, color_sales_map,
+                                         allow_color_repeat, tier_map, priority=8)
+
+    if combo_size == 5:
+        top_pairs = [(pair, score) for pair, score in co_pairs[:max(28, n * 6)] if pair[0] in color_pool and pair[1] in color_pool]
+        for idx, (pair1, score1) in enumerate(top_pairs):
+            for pair2, score2 in top_pairs[idx + 1:]:
+                if set(pair1) & set(pair2):
+                    continue
+                extras = [c for c in color_pool if c not in pair1 and c not in pair2]
+                if extras:
+                    extra = sorted(
+                        extras,
+                        key=lambda c: (8 if tier_map.get(c) == "弱色" else 5, color_score_map.get(c, 0)),
+                        reverse=True,
+                    )[0]
+                    _add_combo_candidate(candidates, list(pair1 + pair2) + [extra], "2+2共购",
+                                         combo_size, excluded_colors, color_sales_map,
+                                         allow_color_repeat, tier_map, priority=8)
+            if len([c for c in candidates.values() if c["base_type"] == "2+2共购"]) >= max(8, n * 2):
+                break
+
+        if triple_map:
+            co_triples = sorted(triple_map.items(), key=lambda x: x[1], reverse=True)
+            for triple, score in co_triples[:max(16, n * 3)]:
+                if not all(c in color_pool for c in triple):
+                    continue
+                for pair, pair_score in top_pairs:
+                    if set(triple) & set(pair):
+                        continue
+                    _add_combo_candidate(candidates, list(triple + pair), "3+1带货",
+                                         combo_size, excluded_colors, color_sales_map,
+                                         allow_color_repeat, tier_map, priority=8)
+                    break
+
+
+def build_candidate_combos(combo_size, n, color_pool, tier_colors, tier_map,
+                           color_score_map, color_sales_map, co_purchase_map,
+                           triple_map, excluded_colors, allow_color_repeat):
+    candidates = {}
+    add_balanced_candidates(candidates, combo_size, n, color_pool, tier_colors, tier_map,
+                            color_sales_map, excluded_colors, allow_color_repeat)
+    add_color_coverage_candidates(candidates, combo_size, n, color_pool, tier_map,
+                                  color_sales_map, excluded_colors, allow_color_repeat)
+    add_co_purchase_candidates(candidates, combo_size, n, color_pool, tier_map, color_score_map,
+                               color_sales_map, co_purchase_map, triple_map,
+                               excluded_colors, allow_color_repeat)
+    return candidates
+
+
+def score_combo_candidates(candidates, tier_map, color_score_map, color_sales_map,
+                           color_cover_map, color_sizes_map, co_purchase_map, rec_sizes,
+                           triple_map, combo_strategy, top1):
+    scored = []
+    for cand in candidates.values():
+        total, ctype, co, min_cov, applicable, tier_counts, strongest_pair, strongest_triple, disjoint_pairs = _score_balanced_combo(
+            cand["combo"], cand["base_type"], tier_map, color_score_map, color_sales_map,
+            color_cover_map, color_sizes_map, co_purchase_map, rec_sizes,
+            triple_map=triple_map, strategy=combo_strategy
+        )
+        scored.append({
+            "score": total,
+            "combo_tuple": cand["combo"],
+            "type": ctype,
+            "base_type": cand["base_type"],
+            "co_score": co,
+            "min_cov": min_cov,
+            "applicable_sizes": applicable,
+            "_key": cand["combo"],
+            "contains_top1": top1 in cand["combo"],
+            "top1_count": cand["combo"].count(top1),
+            "tier_counts": tier_counts,
+            "strongest_pair": strongest_pair,
+            "strongest_triple": strongest_triple,
+            "disjoint_pairs": disjoint_pairs,
+        })
+    return sorted(scored, key=lambda x: x["score"], reverse=True)
+
+
+def select_final_combos(scored, n, combo_size, color_pool, tier_colors):
+    total_slots = n * combo_size
+    top1_slot_limit = max(1, int(total_slots * 0.38 + 0.999))
+    top1_combo_limit = max(1, int(n * 0.60 + 0.999))
+    color_slot_limit = max(2, int(total_slots * 0.32 + 0.999))
+    selected = []
+    color_usage = {}
+    covered_colors = set()
+    co_target = min(n, max(1, int(n * 0.30 + 0.999))) if any(item["co_score"] > 0 for item in scored) else 0
+    weak_target = min(n, max(1, n // 2)) if tier_colors.get("弱色") else 0
+    coverage_target = min(len(color_pool), max(combo_size + 2, int(total_slots * 0.45)))
+
+    def too_similar(item, strict=True):
+        if not selected:
+            return False
+        max_shared = combo_size - 1 if strict else combo_size
+        return any(len(set(item["_key"]) & set(s["_key"])) >= max_shared for s in selected)
+
+    def can_add(item, strict=True, enforce_top1=True):
+        if len(selected) >= n:
+            return False
+        if any(s["_key"] == item["_key"] for s in selected):
+            return False
+        if strict and too_similar(item, strict=True):
+            return False
+        projected_top1_slots = sum(s["top1_count"] for s in selected) + item["top1_count"]
+        projected_top1_combos = sum(1 for s in selected if s["contains_top1"]) + (1 if item["contains_top1"] else 0)
+        if enforce_top1 and (projected_top1_slots > top1_slot_limit or projected_top1_combos > top1_combo_limit):
+            return False
+        for color in item["_key"]:
+            if color_usage.get(color, 0) + item["_key"].count(color) > color_slot_limit:
+                return False
+        return True
+
+    def add_selected(item):
+        selected.append(item)
+        for color in item["_key"]:
+            color_usage[color] = color_usage.get(color, 0) + 1
+            covered_colors.add(color)
+
+    def co_evidence_count(items):
+        return sum(1 for item in items if item["co_score"] > 0 or item["type"] in ["2+2共购", "3+1带货", "共购组合"])
+
+    def weak_combo_count(items):
+        return sum(1 for item in items if item["tier_counts"].get("弱色", 0) > 0)
+
+    def selection_value(item):
+        coverage_gain = len(set(item["_key"]) - covered_colors)
+        similarity_penalty = 0
+        if selected:
+            similarity_penalty = max(_combo_similarity(item["_key"], s["_key"]) for s in selected) * 22
+        value = item["score"] + coverage_gain * 5 - similarity_penalty
+        if co_evidence_count(selected) < co_target and (item["co_score"] > 0 or item["type"] in ["2+2共购", "3+1带货", "共购组合"]):
+            value += 18
+        if weak_combo_count(selected) < weak_target and item["tier_counts"].get("弱色", 0) > 0:
+            value += 14
+        if len(covered_colors) < coverage_target and coverage_gain > 0:
+            value += 10
+        if item["contains_top1"] and sum(1 for s in selected if s["contains_top1"]) >= max(1, top1_combo_limit - 1):
+            value -= 12
+        if item["type"] in ["2+2共购", "3+1带货"]:
+            value += 6
+        return value
+
+    def greedy_fill(strict=True, enforce_top1=True):
+        added = True
+        while len(selected) < n and added:
+            added = False
+            ranked = sorted(scored, key=selection_value, reverse=True)
+            for item in ranked:
+                if can_add(item, strict=strict, enforce_top1=enforce_top1):
+                    add_selected(item)
+                    added = True
+                    break
+
+    for item in sorted(
+        [x for x in scored if x["type"] in ["2+2共购", "3+1带货", "共购组合"] or x["co_score"] > 0],
+        key=selection_value,
+        reverse=True,
+    ):
+        if co_evidence_count(selected) >= co_target:
+            break
+        if can_add(item, strict=True, enforce_top1=True):
+            add_selected(item)
+
+    for item in sorted(
+        [x for x in scored if x["tier_counts"].get("弱色", 0) > 0],
+        key=selection_value,
+        reverse=True,
+    ):
+        if weak_combo_count(selected) >= weak_target:
+            break
+        if can_add(item, strict=True, enforce_top1=True):
+            add_selected(item)
+
+    greedy_fill(strict=True, enforce_top1=True)
+    if len(selected) < n:
+        greedy_fill(strict=False, enforce_top1=True)
+    if len(selected) < n:
+        greedy_fill(strict=False, enforce_top1=False)
+    return selected
+
+
+def format_combo_rows(prod, selected, rec_sizes, combo_size, tier_map):
+    previews = []
+    rows = []
+    for s in selected:
+        formatted = format_combo(s["combo_tuple"])
+        previews.append(formatted)
+        applicable_sizes = s["applicable_sizes"] or rec_sizes[:1]
+        display_type = s["type"]
+        reason = _combo_reason(
+            s["combo_tuple"], display_type, tier_map,
+            s["strongest_pair"], s["strongest_triple"], s["disjoint_pairs"]
+        )
+        note = _combo_note(display_type, s["tier_counts"], s["contains_top1"])
+        if len(rec_sizes) > 1 and len(applicable_sizes) <= 1:
+            note = f"{note} 单尺寸特化，不建议做共用图片".strip()
+        rows.append({
+            "产品型号": prod,
+            "推荐尺寸": " / ".join(rec_sizes),
+            "组合类型": display_type,
+            "推荐组合色号": formatted,
+            "组合件数": combo_size,
+            "是否共用图片": "是" if len(applicable_sizes) >= len(rec_sizes) else ("有限" if len(applicable_sizes) >= 2 else "否"),
+            "适用尺寸": " / ".join(applicable_sizes),
+            "组合推荐分": round(s["score"], 1),
+            "共购证据分": round(s["co_score"], 1),
+            "推荐理由": reason,
+            "注意事项": note,
+        })
+    return previews, rows
+
+
 def generate_product_combos(orders, recommended_sizes, color_scores,
                             combo_size=3, max_combos=6, co_purchase_df=None,
                             allow_color_repeat=True, excluded_colors=None,
@@ -1297,7 +1749,7 @@ def generate_product_combos(orders, recommended_sizes, color_scores,
         if len(all_colors) < 2:
             continue
 
-        color_pool = all_colors[:min(len(all_colors), max(18, n * combo_size))]
+        color_pool = all_colors[:min(len(all_colors), max(MAX_COLOR_POOL_BASE, n * combo_size))]
         pool = prod_colors.copy()
         pool["色号"] = pool["色号"].apply(normalize_color)
         pool = pool[pool["色号"].isin(color_pool)]
@@ -1311,330 +1763,19 @@ def generate_product_combos(orders, recommended_sizes, color_scores,
             for c, g in prod_rec_orders.groupby("_color")
         }
 
-        candidates = {}
-
-        def add_candidate(combo, ctype, priority=0):
-            key = _combo_key(combo)
-            if len(key) != combo_size:
-                return
-            if any(c in excluded_colors for c in key):
-                return
-            if any(not is_valid_normalized_color(c) for c in key):
-                return
-            if any(color_sales_map.get(c, 0) <= 0 for c in key):
-                return
-            if not allow_color_repeat and len(set(key)) < len(key):
-                return
-            if len(set(key)) == 1:
-                return
-            weak_count = sum(1 for c in key if tier_map.get(c) == "弱色")
-            anchor_count = sum(1 for c in key if tier_map.get(c) in ["热卖色", "稳定色"])
-            if weak_count == len(key) or (weak_count >= 2 and anchor_count == 0):
-                return
-            existing = candidates.get(key)
-            if not existing or priority > existing.get("priority", 0):
-                candidates[key] = {"combo": key, "base_type": ctype, "priority": priority}
-
-        # 1) 按颜色层级结构生成均衡铺货候选。
-        for ctype, pattern in _balanced_patterns(combo_size):
-            choice_groups = []
-            valid_pattern = True
-            for tier in ["热卖色", "稳定色", "弱色"]:
-                count = pattern.get(tier, 0)
-                colors = [c for c in tier_colors.get(tier, []) if c in color_pool]
-                choices = _tier_choices(colors, count, allow_color_repeat)
-                if not choices:
-                    valid_pattern = False
-                    break
-                choice_groups.append(choices)
-            if not valid_pattern:
-                continue
-            for parts in product(*choice_groups):
-                combo = []
-                for part in parts:
-                    combo.extend(part)
-                add_candidate(combo, ctype)
-                if len(candidates) >= max(300, n * 60):
-                    break
-
-        # 2) 色卡覆盖候选：从全颜色池中铺开，鼓励差异化和长尾覆盖。
-        if combo_size <= len(color_pool):
-            for combo in combinations(color_pool[:min(len(color_pool), 18)], combo_size):
-                tier_counts = {tier: sum(1 for c in combo if tier_map.get(c) == tier) for tier in ["热卖色", "稳定色", "弱色"]}
-                if tier_counts["弱色"] > max(1, combo_size // 2):
-                    continue
-                add_candidate(combo, "色卡覆盖")
-                if len(candidates) >= max(420, n * 80):
-                    break
-
-        # 3) 共购结构候选：pair / triple / 2+2 / 3+1 / 3+2。
-        if co_purchase_map:
-            co_pairs = sorted(co_purchase_map.items(), key=lambda x: x[1], reverse=True)
-            if combo_size == 2:
-                for (a, b), score in co_pairs[:max(20, n * 5)]:
-                    if a in color_pool and b in color_pool and a != b:
-                        add_candidate([a, b], "共购组合", priority=6)
-
-            for (a, b), score in co_pairs[:max(28, n * 6)]:
-                if a in color_pool and b in color_pool and a != b:
-                    partners = sorted(
-                        [c for c in color_pool if c not in (a, b)],
-                        key=lambda c: (
-                            8 if tier_map.get(c) == "弱色" else (5 if tier_map.get(c) == "稳定色" else 2),
-                            co_purchase_map.get((min(a, c), max(a, c)), 0) +
-                            co_purchase_map.get((min(b, c), max(b, c)), 0),
-                            color_score_map.get(c, 0)
-                        ),
-                        reverse=True,
-                    )
-                    base = [a, b] + partners[:max(combo_size - 2, 0)]
-                    if len(base) == combo_size:
-                        add_candidate(base, "共购组合", priority=4)
-
-            if combo_size >= 3 and triple_map:
-                co_triples = sorted(triple_map.items(), key=lambda x: x[1], reverse=True)
-                for triple, score in co_triples[:max(20, n * 4)]:
-                    if all(c in color_pool for c in triple):
-                        if combo_size == 3:
-                            add_candidate(list(triple), "共购组合", priority=7)
-                        else:
-                            partners = sorted(
-                                [c for c in color_pool if c not in triple],
-                                key=lambda c: (
-                                    9 if tier_map.get(c) == "弱色" else (6 if tier_map.get(c) == "稳定色" else 2),
-                                    sum(co_purchase_map.get((min(c, t), max(c, t)), 0) for t in triple),
-                                    -color_score_map.get(c, 0) if tier_map.get(c) == "热卖色" else color_score_map.get(c, 0),
-                                ),
-                                reverse=True,
-                            )
-                            base = list(triple) + partners[:combo_size - 3]
-                            if len(base) == combo_size:
-                                add_candidate(base, "3+1带货" if combo_size == 4 else "共购组合", priority=8)
-
-            if combo_size == 4:
-                top_pairs = [(pair, score) for pair, score in co_pairs[:max(24, n * 6)] if pair[0] in color_pool and pair[1] in color_pool]
-                for idx, (pair1, score1) in enumerate(top_pairs):
-                    for pair2, score2 in top_pairs[idx + 1:]:
-                        if set(pair1) & set(pair2):
-                            continue
-                        add_candidate(list(pair1 + pair2), "2+2共购", priority=10)
-                        if len([c for c in candidates.values() if c["base_type"] == "2+2共购"]) >= max(8, n * 2):
-                            break
-                    if len([c for c in candidates.values() if c["base_type"] == "2+2共购"]) >= max(8, n * 2):
-                        break
-
-                # 没有真实 triple 时，用强 pair + 稳定色形成三色核心，再带一个长尾/稳定色。
-                for (a, b), score in co_pairs[:max(18, n * 4)]:
-                    if a not in color_pool or b not in color_pool:
-                        continue
-                    core_candidates = sorted(
-                        [c for c in color_pool if c not in (a, b)],
-                        key=lambda c: (
-                            8 if tier_map.get(c) == "稳定色" else (5 if tier_map.get(c) == "热卖色" else 4),
-                            co_purchase_map.get((min(a, c), max(a, c)), 0) +
-                            co_purchase_map.get((min(b, c), max(b, c)), 0),
-                            color_score_map.get(c, 0),
-                        ),
-                        reverse=True,
-                    )
-                    for core_c in core_candidates[:4]:
-                        carriers = sorted(
-                            [c for c in color_pool if c not in (a, b, core_c)],
-                            key=lambda c: (
-                                10 if tier_map.get(c) == "弱色" else (7 if tier_map.get(c) == "稳定色" else 2),
-                                -color_score_map.get(c, 0),
-                            ),
-                            reverse=True,
-                        )
-                        if carriers:
-                            add_candidate([a, b, core_c, carriers[0]], "3+1带货", priority=8)
-
-            if combo_size == 5:
-                top_pairs = [(pair, score) for pair, score in co_pairs[:max(28, n * 6)] if pair[0] in color_pool and pair[1] in color_pool]
-                for idx, (pair1, score1) in enumerate(top_pairs):
-                    for pair2, score2 in top_pairs[idx + 1:]:
-                        if set(pair1) & set(pair2):
-                            continue
-                        extras = [c for c in color_pool if c not in pair1 and c not in pair2]
-                        if extras:
-                            extra = sorted(
-                                extras,
-                                key=lambda c: (8 if tier_map.get(c) == "弱色" else 5, color_score_map.get(c, 0)),
-                                reverse=True,
-                            )[0]
-                            add_candidate(list(pair1 + pair2) + [extra], "2+2共购", priority=8)
-                    if len([c for c in candidates.values() if c["base_type"] == "2+2共购"]) >= max(8, n * 2):
-                        break
-
-                if triple_map:
-                    co_triples = sorted(triple_map.items(), key=lambda x: x[1], reverse=True)
-                    for triple, score in co_triples[:max(16, n * 3)]:
-                        if not all(c in color_pool for c in triple):
-                            continue
-                        for pair, pair_score in top_pairs:
-                            if set(triple) & set(pair):
-                                continue
-                            add_candidate(list(triple + pair), "3+1带货", priority=8)
-                            break
-
-        scored = []
-        for cand in candidates.values():
-            total, ctype, co, min_cov, applicable, tier_counts, strongest_pair, strongest_triple, disjoint_pairs = _score_balanced_combo(
-                cand["combo"], cand["base_type"], tier_map, color_score_map, color_sales_map,
-                color_cover_map, color_sizes_map, co_purchase_map, rec_sizes,
-                triple_map=triple_map, strategy=combo_strategy
-            )
-            scored.append({
-                "score": total,
-                "combo_tuple": cand["combo"],
-                "type": ctype,
-                "base_type": cand["base_type"],
-                "co_score": co,
-                "min_cov": min_cov,
-                "applicable_sizes": applicable,
-                "_key": cand["combo"],
-                "contains_top1": top1 in cand["combo"],
-                "top1_count": cand["combo"].count(top1),
-                "tier_counts": tier_counts,
-                "strongest_pair": strongest_pair,
-                "strongest_triple": strongest_triple,
-                "disjoint_pairs": disjoint_pairs,
-            })
-        scored.sort(key=lambda x: x["score"], reverse=True)
-
-        total_slots = n * combo_size
-        top1_slot_limit = max(1, int(total_slots * 0.38 + 0.999))
-        top1_combo_limit = max(1, int(n * 0.60 + 0.999))
-        color_slot_limit = max(2, int(total_slots * 0.32 + 0.999))
-        selected = []
-        color_usage = {}
-        covered_colors = set()
-        co_target = min(n, max(1, int(n * 0.30 + 0.999))) if any(item["co_score"] > 0 for item in scored) else 0
-        weak_target = min(n, max(1, n // 2)) if tier_colors.get("弱色") else 0
-        coverage_target = min(len(color_pool), max(combo_size + 2, int(total_slots * 0.45)))
-
-        def too_similar(item, strict=True):
-            if not selected:
-                return False
-            max_shared = combo_size - 1 if strict else combo_size
-            return any(len(set(item["_key"]) & set(s["_key"])) >= max_shared for s in selected)
-
-        def can_add(item, strict=True, enforce_top1=True):
-            if len(selected) >= n:
-                return False
-            if any(s["_key"] == item["_key"] for s in selected):
-                return False
-            if strict and too_similar(item, strict=True):
-                return False
-            projected_top1_slots = sum(s["top1_count"] for s in selected) + item["top1_count"]
-            projected_top1_combos = sum(1 for s in selected if s["contains_top1"]) + (1 if item["contains_top1"] else 0)
-            if enforce_top1 and (projected_top1_slots > top1_slot_limit or projected_top1_combos > top1_combo_limit):
-                return False
-            for color in item["_key"]:
-                if color_usage.get(color, 0) + item["_key"].count(color) > color_slot_limit:
-                    return False
-            return True
-
-        def add_selected(item):
-            selected.append(item)
-            for color in item["_key"]:
-                color_usage[color] = color_usage.get(color, 0) + 1
-                covered_colors.add(color)
-
-        def co_evidence_count(items):
-            return sum(1 for item in items if item["co_score"] > 0 or item["type"] in ["2+2共购", "3+1带货", "共购组合"])
-
-        def weak_combo_count(items):
-            return sum(1 for item in items if item["tier_counts"].get("弱色", 0) > 0)
-
-        def selection_value(item):
-            coverage_gain = len(set(item["_key"]) - covered_colors)
-            similarity_penalty = 0
-            if selected:
-                similarity_penalty = max(_combo_similarity(item["_key"], s["_key"]) for s in selected) * 22
-            value = item["score"] + coverage_gain * 5 - similarity_penalty
-            if co_evidence_count(selected) < co_target and (item["co_score"] > 0 or item["type"] in ["2+2共购", "3+1带货", "共购组合"]):
-                value += 18
-            if weak_combo_count(selected) < weak_target and item["tier_counts"].get("弱色", 0) > 0:
-                value += 14
-            if len(covered_colors) < coverage_target and coverage_gain > 0:
-                value += 10
-            if item["contains_top1"] and sum(1 for s in selected if s["contains_top1"]) >= max(1, top1_combo_limit - 1):
-                value -= 12
-            if item["type"] in ["2+2共购", "3+1带货"]:
-                value += 6
-            return value
-
-        def greedy_fill(strict=True, enforce_top1=True):
-            added = True
-            while len(selected) < n and added:
-                added = False
-                ranked = sorted(scored, key=selection_value, reverse=True)
-                for item in ranked:
-                    if can_add(item, strict=strict, enforce_top1=enforce_top1):
-                        add_selected(item)
-                        added = True
-                        break
-
-        # 先抢占一部分有共购证据的结构，再补长尾覆盖，最后按整批质量贪心填满。
-        for item in sorted(
-            [x for x in scored if x["type"] in ["2+2共购", "3+1带货", "共购组合"] or x["co_score"] > 0],
-            key=selection_value,
-            reverse=True,
-        ):
-            if co_evidence_count(selected) >= co_target:
-                break
-            if can_add(item, strict=True, enforce_top1=True):
-                add_selected(item)
-
-        for item in sorted(
-            [x for x in scored if x["tier_counts"].get("弱色", 0) > 0],
-            key=selection_value,
-            reverse=True,
-        ):
-            if weak_combo_count(selected) >= weak_target:
-                break
-            if can_add(item, strict=True, enforce_top1=True):
-                add_selected(item)
-
-        greedy_fill(strict=True, enforce_top1=True)
-
-        # 候选足够但相似度过严时，放宽相似度；仍控制 Top1 和重复。
-        if len(selected) < n:
-            greedy_fill(strict=False, enforce_top1=True)
-
-        # 最后一轮只放宽 Top1 软限制，避免有效候选足够却无法补满；仍不允许重复组合。
-        if len(selected) < n:
-            greedy_fill(strict=False, enforce_top1=False)
-
-        # ---- 输出 ----
-        previews = []
-        for s in selected:
-            formatted = format_combo(s["combo_tuple"])
-            previews.append(formatted)
-            applicable_sizes = s["applicable_sizes"] or rec_sizes[:1]
-            display_type = s["type"]
-            reason = _combo_reason(
-                s["combo_tuple"], display_type, tier_map,
-                s["strongest_pair"], s["strongest_triple"], s["disjoint_pairs"]
-            )
-            note = _combo_note(display_type, s["tier_counts"], s["contains_top1"])
-            if len(rec_sizes) > 1 and len(applicable_sizes) <= 1:
-                note = f"{note} 单尺寸特化，不建议做共用图片".strip()
-            all_combo_rows.append({
-                "产品型号": prod,
-                "推荐尺寸": " / ".join(rec_sizes),
-                "组合类型": display_type,
-                "推荐组合色号": formatted,
-                "组合件数": combo_size,
-                "是否共用图片": "是" if len(applicable_sizes) >= len(rec_sizes) else ("有限" if len(applicable_sizes) >= 2 else "否"),
-                "适用尺寸": " / ".join(applicable_sizes),
-                "组合推荐分": round(s["score"], 1),
-                "共购证据分": round(s["co_score"], 1),
-                "推荐理由": reason,
-                "注意事项": note,
-            })
-
+        candidates = build_candidate_combos(
+            combo_size, n, color_pool, tier_colors, tier_map,
+            color_score_map, color_sales_map, co_purchase_map,
+            triple_map, excluded_colors, allow_color_repeat
+        )
+        scored = score_combo_candidates(
+            candidates, tier_map, color_score_map, color_sales_map,
+            color_cover_map, color_sizes_map, co_purchase_map, rec_sizes,
+            triple_map, combo_strategy, top1
+        )
+        selected = select_final_combos(scored, n, combo_size, color_pool, tier_colors)
+        previews, rows = format_combo_rows(prod, selected, rec_sizes, combo_size, tier_map)
+        all_combo_rows.extend(rows)
         product_combos_preview[prod] = " | ".join(previews[:max_combos])
 
     combo_df = pd.DataFrame(all_combo_rows).sort_values(["产品型号", "组合推荐分"], ascending=[True, False]) if all_combo_rows else pd.DataFrame()
@@ -1823,6 +1964,12 @@ def get_product_color_options(orders, product):
     return sorted({c for c in colors if is_valid_normalized_color(c)})
 
 
+def make_cache_key(namespace, **params):
+    normalized = json.dumps(params, ensure_ascii=False, sort_keys=True, default=str)
+    digest = hashlib.md5(normalized.encode("utf-8")).hexdigest()
+    return f"{namespace}_{digest}"
+
+
 def build_combo_diagnostics(combo_df, target_combos, combo_size):
     if combo_df.empty or "推荐组合色号" not in combo_df.columns:
         return "", ""
@@ -1903,10 +2050,19 @@ def generate_single_product_result(orders, product, min_sales, max_combos, allow
     if combo_size < 2:
         combo_size = 3
 
-    cache_key = (
-        f"{cache_prefix}_balanced_stock_v5_{product}_{min_sales}_{max_combos}_{allow_repeat}_"
-        f"{size_scope}_{combo_size}_{cache_context}_{','.join(rec_sizes)}_excluded_{excluded_key}"
-        f"_strategy_{combo_strategy}"
+    cache_key = make_cache_key(
+        f"{cache_prefix}_single_product_combo",
+        product=product,
+        min_sales=min_sales,
+        max_combos=max_combos,
+        allow_repeat=allow_repeat,
+        size_scope=size_scope,
+        combo_size=combo_size,
+        cache_context=cache_context,
+        recommended_sizes=rec_sizes,
+        excluded_colors=excluded_colors,
+        excluded_key=excluded_key,
+        combo_strategy=combo_strategy,
     )
     if cache_key in st.session_state:
         return st.session_state[cache_key]
