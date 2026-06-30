@@ -91,7 +91,7 @@ class SeaFreightCoreTests(unittest.TestCase):
         orders, sizes, colors = self._combo_fixture()
         _, df = sf.generate_product_combos(
             orders, sizes, colors, combo_size=4, max_combos=8,
-            allow_color_repeat=True, excluded_colors=["003"], combo_strategy="均衡铺货优先"
+            allow_color_repeat=True, excluded_colors=["003"], phase="成熟复购"
         )
         self.assertTrue(all("003" not in str(v).split("、") for v in df["推荐组合色号"]))
 
@@ -99,11 +99,42 @@ class SeaFreightCoreTests(unittest.TestCase):
         orders, sizes, colors = self._combo_fixture()
         _, df = sf.generate_product_combos(
             orders, sizes, colors, combo_size=4, max_combos=8,
-            allow_color_repeat=True, excluded_colors=[], combo_strategy="均衡铺货优先"
+            allow_color_repeat=True, excluded_colors=[], phase="成熟复购"
         )
         combo_types = set(df["组合类型"])
         self.assertIn("2+2共购", combo_types)
         self.assertIn("3+1带货", combo_types)
+
+    def test_first_batch_excludes_weak_colors(self):
+        orders, sizes, colors = self._combo_fixture()
+        weak_colors = self._weak_colors(orders, colors)
+        self.assertTrue(weak_colors)
+        _, df = sf.generate_product_combos(
+            orders, sizes, colors, combo_size=4, max_combos=8,
+            allow_color_repeat=True, excluded_colors=[], phase="首批试单"
+        )
+        self.assertFalse(df.empty)
+        for value in df["推荐组合色号"]:
+            combo_colors = set(str(value).split("、"))
+            self.assertFalse(combo_colors & weak_colors)
+        self.assertNotIn("铺货测试", set(df["组合类型"]))
+
+    def test_mature_repurchase_allows_weak_colors(self):
+        orders, sizes, colors = self._combo_fixture()
+        weak_colors = self._weak_colors(orders, colors)
+        _, df = sf.generate_product_combos(
+            orders, sizes, colors, combo_size=4, max_combos=8,
+            allow_color_repeat=True, excluded_colors=[], phase="成熟复购"
+        )
+        used_colors = set()
+        for value in df["推荐组合色号"]:
+            used_colors.update(str(value).split("、"))
+        self.assertTrue(used_colors & weak_colors)
+
+    def test_cache_key_changes_by_phase(self):
+        first_key = sf.make_cache_key("combo", product="LW401", combo_size=4, phase="首批试单")
+        mature_key = sf.make_cache_key("combo", product="LW401", combo_size=4, phase="成熟复购")
+        self.assertNotEqual(first_key, mature_key)
 
     @staticmethod
     def _combo_fixture():
@@ -143,6 +174,12 @@ class SeaFreightCoreTests(unittest.TestCase):
             "推荐尺寸覆盖数": [1] * 8,
         })
         return orders, sizes, colors
+
+    @staticmethod
+    def _weak_colors(orders, colors):
+        co_map, _, _ = sf._build_combo_evidence(orders)
+        tier_map, _, _ = sf._build_color_tiers(colors, co_map)
+        return {color for color, tier in tier_map.items() if tier == "弱色"}
 
 
 if __name__ == "__main__":

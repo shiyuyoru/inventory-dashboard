@@ -4,7 +4,7 @@ Keep these values aligned with the current production logic unless the
 business rules intentionally change.
 """
 
-APP_VERSION = "v5.3.02"
+APP_VERSION = "v5.3.03"
 
 PRODUCT_RECOMMEND_STRONG_SALES = 100
 PRODUCT_RECOMMEND_NORMAL_SALES = 50
@@ -30,3 +30,12 @@ COMBO_STRATEGY_WEIGHTS = {
     "销量转化优先": {"sales": 0.45, "balance": 0.10, "co": 0.30, "weak": 0.05, "diff": 0.10},
 }
 
+PHASE_COMBO_WEIGHTS = {
+    "首批试单": {"sales": 0.55, "balance": 0.10, "co": 0.25, "weak": 0.00, "diff": 0.10},
+    "成熟复购": COMBO_STRATEGY_WEIGHTS["均衡铺货优先"],
+}
+
+PHASE_ALLOW_WEAK = {
+    "首批试单": False,
+    "成熟复购": True,
+}
