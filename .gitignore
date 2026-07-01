@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 .streamlit/
+.u2net/
 app_v5_backup.py
 *_backup.py
 web_runs/

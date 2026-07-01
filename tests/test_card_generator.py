@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 from PIL import Image, ImageDraw
@@ -13,8 +14,10 @@ from card_generator import (
     create_card_run_dir,
     extract_lure_from_poster,
     index_uploaded_files_by_color,
+    load_font,
     parse_custom_combo_text,
     prepare_cutouts,
+    resolve_model_path,
     suppress_soft_shadow,
     validate_cutout_paths,
 )
@@ -95,6 +98,12 @@ class CardGeneratorTests(unittest.TestCase):
         self.assertEqual(cleaned.getpixel((30, 28))[:3], (255, 255, 255))
         self.assertEqual(cleaned.getpixel((30, 15))[:3], (40, 140, 220))
 
+    def test_load_font_keeps_card_label_readable(self):
+        font = load_font(62)
+        bbox = font.getbbox("013")
+        self.assertGreaterEqual(bbox[2] - bbox[0], 55)
+        self.assertGreaterEqual(bbox[3] - bbox[1], 35)
+
     def test_build_combo_cards_creates_png_and_zip(self):
         combo_df = pd.DataFrame({"推荐组合色号": ["003、001、014"]})
 
@@ -172,6 +181,60 @@ class CardGeneratorTests(unittest.TestCase):
 
             self.assertEqual([p.name for p in result.card_paths], ["34.png"])
 
+    def test_resolve_model_path_uses_env_model_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            model_path = Path(tmp) / "custom.onnx"
+            model_path.write_bytes(b"model")
+            with patch.dict("os.environ", {"BAIT_CARD_MODEL_PATH": str(model_path)}, clear=True):
+                self.assertEqual(resolve_model_path(), model_path)
+
+    def test_resolve_model_path_uses_env_model_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            model_path = Path(tmp) / "birefnet-general.onnx"
+            model_path.write_bytes(b"model")
+            with patch.dict("os.environ", {"BAIT_CARD_MODEL_DIR": tmp}, clear=True):
+                self.assertEqual(resolve_model_path(), model_path)
+
+    def test_resolve_model_path_reports_clear_error_when_missing(self):
+        missing_model = Path(tempfile.gettempdir()) / "missing-bait-card-model.onnx"
+        with patch.dict("os.environ", {"BAIT_CARD_MODEL_PATH": str(missing_model)}, clear=False):
+            with self.assertRaisesRegex(FileNotFoundError, "BAIT_CARD_MODEL_DIR"):
+                resolve_model_path()
+
+    def test_uncertain_status_does_not_block_card_generation(self):
+        combo_df = pd.DataFrame({"推荐组合色号": ["009、016"]})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_paths = create_card_run_dir(Path(tmp) / "web_runs")
+            image_paths = {}
+            for color in ["009", "016"]:
+                path = run_paths["png_dir"] / f"{color}.png"
+                image = Image.new("RGBA", (520, 130), (255, 255, 255, 0))
+                draw = ImageDraw.Draw(image)
+                draw.rounded_rectangle((20, 28, 500, 102), radius=32, fill=(80, 150, 220, 255))
+                image.save(path)
+                image_paths[color] = path
+
+            result = build_combo_cards(
+                combo_df,
+                image_paths,
+                run_paths,
+                per_color_status={
+                    "009": {
+                        "uncertain": True,
+                        "severity": "review",
+                        "message": "主体识别置信度偏低，建议人工复核成品。",
+                        "debug_dir": str(run_paths["debug_dir"] / "009"),
+                        "final_cutout": str(run_paths["debug_dir"] / "009" / "final_cutout.png"),
+                    }
+                },
+            )
+
+            self.assertEqual(len(result.card_paths), 1)
+            self.assertEqual(result.warnings, [])
+            self.assertEqual(result.card_review_status, {"916.png": ["009"]})
+            self.assertTrue(result.per_color_status["009"]["uncertain"])
+
     def test_prepare_cutouts_skips_valid_transparent_png_without_warning(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_paths = create_card_run_dir(Path(tmp) / "web_runs")
@@ -184,10 +247,12 @@ class CardGeneratorTests(unittest.TestCase):
                 image.save(path)
                 raw_paths[color] = path
 
-            cutout_paths, warnings = prepare_cutouts(raw_paths, run_paths, rembg_session=None)
+            cutout_paths, warnings, per_color_status = prepare_cutouts(raw_paths, run_paths, rembg_session=None)
 
             self.assertEqual(warnings, [])
             self.assertEqual(sorted(cutout_paths), ["009", "016"])
+            self.assertFalse(per_color_status["009"]["uncertain"])
+            self.assertEqual(per_color_status["009"]["severity"], "ok")
             self.assertEqual(validate_cutout_paths(["009", "016"], cutout_paths), [])
             self.assertTrue((run_paths["debug_dir"] / "009" / "final_cutout.png").exists())
             self.assertIn("skipped rembg", (run_paths["debug_dir"] / "mapping.log").read_text(encoding="utf-8"))

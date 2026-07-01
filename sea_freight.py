@@ -13,9 +13,7 @@ from itertools import combinations, combinations_with_replacement, product
 from pathlib import Path
 from PIL import Image
 from card_generator import (
-    MODEL_DIR,
     MODEL_NAME,
-    MODEL_PATH,
     build_combo_cards,
     collect_required_colors,
     create_card_run_dir,
@@ -24,6 +22,7 @@ from card_generator import (
     index_uploaded_files_by_color,
     parse_custom_combo_text,
     prepare_cutouts,
+    resolve_model_path,
     save_uploaded_color_bytes,
     validate_cutout_paths,
 )
@@ -2059,10 +2058,11 @@ def _combo_rows_to_df(rows):
 
 
 @STREAMLIT_CACHE_RESOURCE(show_spinner=False)
-def get_birefnet_rembg_session():
-    if not MODEL_PATH.exists():
-        raise RuntimeError(f"未找到 birefnet-general 模型文件：{MODEL_PATH}")
-    os.environ["U2NET_HOME"] = str(MODEL_DIR)
+def get_birefnet_rembg_session(model_path_text: str):
+    model_path = Path(model_path_text)
+    if not model_path.exists():
+        raise RuntimeError("未找到 birefnet-general 模型文件，请配置 BAIT_CARD_MODEL_DIR 或 BAIT_CARD_MODEL_PATH。")
+    os.environ["U2NET_HOME"] = str(model_path.parent)
     os.environ.setdefault("OMP_NUM_THREADS", "4")
     try:
         from rembg import new_session
@@ -2185,6 +2185,7 @@ def render_combo_card_generator(combo_df, product, module_key):
         st.markdown("**4. 上传原图**")
         st.caption("支持批量上传，文件名请使用 1.png、001.png、14.jpg、014.webp 这类色号命名。")
         st.caption("未抠图白底单品图会自动尝试提取鱼饵主体；整张多色海报请先拆成单色图片后再上传。")
+        st.caption("模型配置：可设置 BAIT_CARD_MODEL_PATH 指向 birefnet-general.onnx，或设置 BAIT_CARD_MODEL_DIR 指向模型目录。")
         with st.form(f"{module_key}_card_upload_form_{final_signature}"):
             bulk_files = st.file_uploader(
                 "批量上传当前产品色号原图",
@@ -2295,8 +2296,9 @@ def render_combo_card_generator(combo_df, product, module_key):
 
                     rembg_session = None
                     if needs_model:
-                        status.write(f"正在加载抠图模型：{MODEL_PATH}")
-                        rembg_session = get_birefnet_rembg_session()
+                        model_path = resolve_model_path()
+                        status.write(f"正在加载抠图模型：{model_path}")
+                        rembg_session = get_birefnet_rembg_session(str(model_path))
                     else:
                         status.write("上传文件已包含有效透明通道，跳过模型抠图。")
                     progress.progress(28)
@@ -2305,7 +2307,7 @@ def render_combo_card_generator(combo_df, product, module_key):
                         status.write(message)
                         progress.progress(min(78, 28 + int(idx / max(total, 1) * 50)))
 
-                    cutout_paths, cutout_warnings = prepare_cutouts(
+                    cutout_paths, cutout_warnings, per_color_status = prepare_cutouts(
                         raw_paths,
                         run_paths,
                         rembg_session,
@@ -2326,6 +2328,7 @@ def render_combo_card_generator(combo_df, product, module_key):
                         auto_angle_correction=auto_angle_correction,
                         raw_paths=raw_paths,
                         warnings=cutout_warnings,
+                        per_color_status=per_color_status,
                     )
                     st.session_state[result_key] = card_result
                     card_state["result"] = card_result
@@ -2363,6 +2366,17 @@ def render_combo_card_generator(combo_df, product, module_key):
             for idx, card_path in enumerate(card_result.card_paths):
                 with preview_cols[idx % 4]:
                     st.image(str(card_path), caption=card_path.name, use_container_width=True)
+                    review_colors = (card_result.card_review_status or {}).get(card_path.name, [])
+                    if review_colors:
+                        st.caption(f"建议人工复核：{'、'.join(review_colors)}")
+                        with st.expander("查看复核提示", expanded=False):
+                            for color in review_colors:
+                                info = (card_result.per_color_status or {}).get(color, {})
+                                st.caption(f"{color}：{info.get('message', '主体识别置信度偏低，建议人工复核成品。')}")
+                                if info.get("final_cutout"):
+                                    st.caption(f"final_cutout：{info['final_cutout']}")
+                                if info.get("debug_dir"):
+                                    st.caption(f"debug：{info['debug_dir']}")
                     st.download_button(
                         "下载 PNG",
                         data=card_path.read_bytes(),

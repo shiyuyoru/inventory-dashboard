@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import math
+import os
 import re
 import uuid
 import zipfile
@@ -15,8 +16,8 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 MODEL_NAME = "birefnet-general"
-MODEL_DIR = Path(r"D:\codex\.u2net")
-MODEL_PATH = MODEL_DIR / "birefnet-general.onnx"
+MODEL_FILENAME = f"{MODEL_NAME}.onnx"
+MODEL_CONFIG_ERROR = "未找到 birefnet-general 模型文件，请配置 BAIT_CARD_MODEL_DIR 或 BAIT_CARD_MODEL_PATH。"
 CANVAS_SIZE = 1000
 CARD_SIZE = (CANVAS_SIZE, CANVAS_SIZE)
 CARD_BACKGROUND = (255, 255, 255)
@@ -68,6 +69,12 @@ ANGLE_SAMPLE_SIZE = 220
 FONT_CANDIDATES = [
     Path(r"C:\Windows\Fonts\arial.ttf"),
     Path(r"C:\Windows\Fonts\msyh.ttc"),
+    Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+    Path("/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf"),
+    Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+    "DejaVuSans.ttf",
+    "LiberationSans-Regular.ttf",
+    "Arial.ttf",
 ]
 
 
@@ -84,6 +91,37 @@ class CardGenerationResult:
     raw_paths: dict[str, Path]
     cutout_paths: dict[str, Path]
     warnings: list[str]
+    per_color_status: dict[str, dict]
+    card_review_status: dict[str, list[str]]
+
+
+def resolve_model_path(require_exists: bool = True) -> Path:
+    env_model_path = os.environ.get("BAIT_CARD_MODEL_PATH")
+    if env_model_path:
+        path = Path(env_model_path).expanduser()
+        if path.suffix.lower() == ".onnx":
+            if not require_exists or path.exists():
+                return path
+            raise FileNotFoundError(MODEL_CONFIG_ERROR)
+
+    env_model_dir = os.environ.get("BAIT_CARD_MODEL_DIR")
+    candidates = []
+    if env_model_dir:
+        candidates.append(Path(env_model_dir).expanduser() / MODEL_FILENAME)
+
+    project_dir = Path(__file__).resolve().parent
+    candidates.extend([
+        project_dir / ".u2net" / MODEL_FILENAME,
+    ])
+    try:
+        candidates.append(Path.home() / ".u2net" / MODEL_FILENAME)
+    except RuntimeError:
+        pass
+
+    for path in candidates:
+        if not require_exists or path.exists():
+            return path
+    raise FileNotFoundError(MODEL_CONFIG_ERROR)
 
 
 def normalize_color_code(value) -> str:
@@ -246,13 +284,21 @@ def save_uploaded_color_bytes(file_name: str, data: bytes, color_code: str, raw_
 
 
 def load_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    for font_path in FONT_CANDIDATES:
-        if font_path.exists():
-            try:
-                return ImageFont.truetype(str(font_path), size)
-            except OSError:
+    for candidate in FONT_CANDIDATES:
+        if isinstance(candidate, Path):
+            if not candidate.exists():
                 continue
-    return ImageFont.load_default()
+            font_source = str(candidate)
+        else:
+            font_source = candidate
+        try:
+            return ImageFont.truetype(font_source, size)
+        except OSError:
+            continue
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
 
 
 def format_label(color_code: str) -> str:
@@ -505,9 +551,10 @@ def prepare_cutouts(
     run_paths: dict[str, Path],
     rembg_session,
     progress_callback=None,
-) -> tuple[dict[str, Path], list[str]]:
+) -> tuple[dict[str, Path], list[str], dict[str, dict]]:
     cutout_paths: dict[str, Path] = {}
     warnings: list[str] = []
+    per_color_status: dict[str, dict] = {}
     mapping_lines: list[str] = []
 
     for idx, (color, raw_path) in enumerate(sorted(raw_paths.items(), key=lambda item: int(item[0])), start=1):
@@ -519,6 +566,13 @@ def prepare_cutouts(
         out_path = run_paths["png_dir"] / f"{color}.png"
         if out_path.exists() and out_path.stat().st_mtime >= raw_path.stat().st_mtime:
             cutout_paths[color] = out_path
+            per_color_status[color] = {
+                "uncertain": False,
+                "severity": "ok",
+                "message": "已复用本次任务中已有透明 PNG。",
+                "debug_dir": str(color_debug_dir),
+                "final_cutout": str(out_path),
+            }
             mapping_lines.append(f"color {color} -> raw {raw_path} -> reused png {out_path}")
             continue
 
@@ -537,23 +591,36 @@ def prepare_cutouts(
         filtered_mask.save(color_debug_dir / "filtered_mask.png")
         final_cutout.save(color_debug_dir / "final_cutout.png")
 
+        status = {
+            "uncertain": bool(uncertain),
+            "severity": "review" if uncertain else "ok",
+            "message": "主体识别置信度偏低，建议人工复核成品。" if uncertain else "主体识别正常。",
+            "debug_dir": str(color_debug_dir),
+            "final_cutout": str(color_debug_dir / "final_cutout.png"),
+        }
         if uncertain:
             mapping_lines.append(f"color {color} -> low confidence subject selection; debug retained")
 
         alpha_bbox = final_cutout.getchannel("A").getbbox() if final_cutout.mode == "RGBA" else None
         if alpha_bbox is None:
-            warnings.append(f"{color} 未识别到有效鱼饵主体，请上传更干净的单色号鱼饵图。")
+            message = f"{color} 未识别到有效鱼饵主体，请上传更干净的单色号鱼饵图。"
+            warnings.append(message)
+            status.update({"uncertain": True, "severity": "error", "message": message})
         else:
             area = (alpha_bbox[2] - alpha_bbox[0]) * (alpha_bbox[3] - alpha_bbox[1])
             if area < max(300, final_cutout.width * final_cutout.height * 0.02):
-                warnings.append(f"{color} 鱼饵主体面积过小，请检查上传图或 debug 文件。")
+                message = f"{color} 鱼饵主体面积过小，请检查上传图或 debug 文件。"
+                warnings.append(message)
+                status.update({"uncertain": True, "severity": "warning", "message": message})
 
         final_cutout.save(out_path)
         cutout_paths[color] = out_path
+        status["output_png"] = str(out_path)
+        per_color_status[color] = status
         mapping_lines.append(f"color {color} -> cutout {out_path}")
 
     write_mapping_log(run_paths, mapping_lines)
-    return cutout_paths, warnings
+    return cutout_paths, warnings, per_color_status
 
 
 def validate_cutout_paths(required_colors: list[str], cutout_paths: dict[str, Path]) -> list[str]:
@@ -733,10 +800,13 @@ def build_combo_cards(
     auto_angle_correction: bool = True,
     raw_paths: dict[str, Path] | None = None,
     warnings: list[str] | None = None,
+    per_color_status: dict[str, dict] | None = None,
 ) -> CardGenerationResult:
     card_paths: list[Path] = []
     missing_colors: set[str] = set()
     seen_names: set[str] = set()
+    per_color_status = per_color_status or {}
+    card_review_status: dict[str, list[str]] = {}
 
     if combo_df is not None and not combo_df.empty and "推荐组合色号" in combo_df.columns:
         for _, row in combo_df.iterrows():
@@ -755,6 +825,12 @@ def build_combo_cards(
             seen_names.add(filename)
             out_path = run_paths["cards_dir"] / filename
             card_paths.append(make_combo_card(colors, image_paths, out_path, auto_angle_correction=auto_angle_correction))
+            review_colors = [
+                color for color in colors
+                if per_color_status.get(color, {}).get("uncertain")
+            ]
+            if review_colors:
+                card_review_status[out_path.name] = review_colors
 
     zip_path = run_paths["zip_path"]
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -773,6 +849,8 @@ def build_combo_cards(
         raw_paths=raw_paths or {},
         cutout_paths=image_paths,
         warnings=warnings or [],
+        per_color_status=per_color_status,
+        card_review_status=card_review_status,
     )
 
 
