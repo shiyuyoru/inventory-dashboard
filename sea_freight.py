@@ -8,16 +8,24 @@ import re
 import io
 import json
 import hashlib
+import os
 from itertools import combinations, combinations_with_replacement, product
 from pathlib import Path
+from PIL import Image
 from card_generator import (
+    MODEL_DIR,
+    MODEL_NAME,
+    MODEL_PATH,
     build_combo_cards,
     collect_required_colors,
     create_card_run_dir,
     format_combo_colors,
+    has_effective_alpha,
     index_uploaded_files_by_color,
     parse_custom_combo_text,
-    save_uploaded_color_image,
+    prepare_cutouts,
+    save_uploaded_color_bytes,
+    validate_cutout_paths,
 )
 from config import (
     FORCED_WEAK_COLOR_RATIO,
@@ -42,6 +50,8 @@ from config import (
 # ============================================================
 FR_KEYS = ["法国", "france", "fr"]
 IT_KEYS = ["意大利", "italy", "it"]
+STREAMLIT_CACHE_RESOURCE = getattr(st, "cache_resource", lambda **kwargs: (lambda func: func))
+STREAMLIT_FRAGMENT = getattr(st, "fragment", lambda func=None: func if func is not None else (lambda f: f))
 
 
 def is_france(val):
@@ -2026,29 +2036,62 @@ def _combo_card_signature(product, combo_df):
     return hashlib.md5(raw.encode("utf-8")).hexdigest()[:12]
 
 
+def _combo_card_state(module_key, base_signature):
+    key = f"{module_key}_card_state_{base_signature}"
+    if key not in st.session_state:
+        st.session_state[key] = {
+            "product": "",
+            "source": "使用推荐组合",
+            "confirmed_combo_rows": [],
+            "required_colors": [],
+            "uploaded_files": {},
+            "uploaded_file_map": {},
+            "missing_colors": [],
+            "run_dir": "",
+            "result": None,
+            "result_signature": "",
+        }
+    return key, st.session_state[key]
+
+
+def _combo_rows_to_df(rows):
+    return pd.DataFrame(rows) if rows else pd.DataFrame(columns=["推荐组合色号", "组合类型", "组合件数"])
+
+
+@STREAMLIT_CACHE_RESOURCE(show_spinner=False)
+def get_birefnet_rembg_session():
+    if not MODEL_PATH.exists():
+        raise RuntimeError(f"未找到 birefnet-general 模型文件：{MODEL_PATH}")
+    os.environ["U2NET_HOME"] = str(MODEL_DIR)
+    os.environ.setdefault("OMP_NUM_THREADS", "4")
+    try:
+        from rembg import new_session
+    except ImportError as exc:
+        raise RuntimeError("当前环境未安装 rembg，请安装 requirements.txt 中的 rembg[cpu] 后重试。") from exc
+    return new_session(MODEL_NAME)
+
+
+@STREAMLIT_FRAGMENT
 def render_combo_card_generator(combo_df, product, module_key):
     if combo_df is None or combo_df.empty or "推荐组合色号" not in combo_df.columns:
         return
 
     base_signature = _combo_card_signature(product, combo_df)
+    state_key, card_state = _combo_card_state(module_key, base_signature)
 
     with st.expander("组合色卡生成", expanded=False):
         st.markdown(f"**当前产品：** `{product}`")
         st.markdown("**1. 选择组合来源**")
-        source = st.radio(
-            "组合来源",
-            ["使用推荐组合", "自定义组合"],
-            horizontal=True,
-            key=f"{module_key}_card_source_{base_signature}",
-        )
-
-        st.markdown("**2. 确定本次要做的组合**")
-        selected_combo_df = pd.DataFrame(columns=combo_df.columns)
-        custom_errors = []
-
-        if source == "使用推荐组合":
+        with st.form(f"{module_key}_card_combo_form_{base_signature}"):
+            source = st.radio(
+                "组合来源",
+                ["使用推荐组合", "自定义组合"],
+                horizontal=True,
+                index=0 if card_state.get("source") != "自定义组合" else 1,
+            )
+            st.markdown("**2. 确定本次要做的组合**")
+            st.caption("表单内勾选或输入不会立即触发生成；点击“确认本次组合”后才更新上传色号。")
             rec_df = combo_df.reset_index(drop=True).copy()
-            st.caption("勾选这次要生成色卡的推荐组合。未勾选的组合不会要求上传图片，也不会生成。")
             selected_indices = []
             pick_cols = st.columns(2)
             for idx, row in rec_df.iterrows():
@@ -2063,110 +2106,236 @@ def render_combo_card_generator(combo_df, product, module_key):
                 with pick_cols[idx % 2]:
                     checked = st.checkbox(
                         "｜".join(label_parts),
-                        value=False,
+                        value=idx in card_state.get("selected_indices", []),
                         key=f"{module_key}_card_pick_{base_signature}_{idx}",
                     )
                 if checked:
                     selected_indices.append(idx)
-            if selected_indices:
-                selected_combo_df = rec_df.iloc[selected_indices].copy()
-            else:
-                st.info("请先选择至少一个组合。")
-        else:
             custom_text = st.text_area(
                 "自定义组合",
-                value="",
+                value=card_state.get("custom_text", ""),
                 height=130,
                 placeholder="每行一个组合，例如：\n3,4\n1,5\n3,4,5,6",
-                key=f"{module_key}_card_custom_text_{base_signature}",
             )
-            custom_combos, custom_errors = parse_custom_combo_text(custom_text)
-            for error in custom_errors:
-                st.warning(error)
-            if custom_combos:
-                selected_combo_df = pd.DataFrame({
-                    "产品型号": product,
-                    "推荐组合色号": [format_combo_colors(colors) for colors in custom_combos],
-                    "组合类型": "自定义组合",
-                    "组合件数": [len(colors) for colors in custom_combos],
-                })
-            elif custom_text.strip() and not custom_errors:
-                st.info("请先输入至少一个有效组合。")
-            elif not custom_text.strip():
-                st.info("请输入要生成的组合，每行一个。")
+            confirm_combo = st.form_submit_button("确认本次组合", type="primary")
 
-        display_cols = [c for c in ["推荐组合色号", "组合类型", "组合件数"] if c in selected_combo_df.columns]
-        if selected_combo_df.empty:
-            st.caption("当前已选组合：暂无")
+        if confirm_combo:
+            selected_combo_df = pd.DataFrame(columns=combo_df.columns)
+            errors = []
+            if source == "使用推荐组合":
+                if selected_indices:
+                    selected_combo_df = rec_df.iloc[selected_indices].copy()
+                else:
+                    errors.append("请先选择至少一个组合。")
+            else:
+                custom_combos, errors = parse_custom_combo_text(custom_text)
+                if custom_combos:
+                    selected_combo_df = pd.DataFrame({
+                        "产品型号": product,
+                        "推荐组合色号": [format_combo_colors(colors) for colors in custom_combos],
+                        "组合类型": "自定义组合",
+                        "组合件数": [len(colors) for colors in custom_combos],
+                    })
+                elif not errors:
+                    errors = ["请输入至少一个有效组合。"]
+            if errors:
+                card_state["confirmed_combo_rows"] = []
+                card_state["required_colors"] = []
+                for error in errors:
+                    st.warning(error)
+            else:
+                required_colors = collect_required_colors(selected_combo_df)
+                card_state.update({
+                    "product": product,
+                    "source": source,
+                    "selected_indices": selected_indices,
+                    "custom_text": custom_text,
+                    "confirmed_combo_rows": selected_combo_df.to_dict("records"),
+                    "required_colors": required_colors,
+                    "uploaded_files": {},
+                    "uploaded_file_map": {},
+                    "missing_colors": required_colors,
+                    "result": None,
+                    "result_signature": _combo_card_signature(product, selected_combo_df),
+                })
+                st.success(f"已确认 {len(selected_combo_df)} 组组合。")
+
+        confirmed_combo_df = _combo_rows_to_df(card_state.get("confirmed_combo_rows", []))
+        display_cols = [c for c in ["推荐组合色号", "组合类型", "组合件数"] if c in confirmed_combo_df.columns]
+        if confirmed_combo_df.empty:
+            st.info("请先在上方表单确认本次要生成的组合。")
         else:
-            st.caption(f"当前已选组合：{len(selected_combo_df)} 组")
-            st.dataframe(selected_combo_df[display_cols], use_container_width=True, hide_index=True, height=160)
+            st.caption(f"当前已确认组合：{len(confirmed_combo_df)} 组")
+            st.dataframe(confirmed_combo_df[display_cols], use_container_width=True, hide_index=True, height=160)
 
         st.markdown("**3. 显示本次需要上传的色号**")
-        required_colors = collect_required_colors(selected_combo_df)
+        required_colors = card_state.get("required_colors", [])
         if required_colors:
             st.caption("本次需要上传色号：" + "、".join(required_colors))
         else:
-            st.info("选择组合后会在这里显示需要上传的色号。")
+            st.caption("确认组合后会在这里显示需要上传的色号。")
 
-        if selected_combo_df.empty or not required_colors or custom_errors:
+        if confirmed_combo_df.empty or not required_colors:
             return
 
-        final_signature = _combo_card_signature(product, selected_combo_df)
-        upload_prefix = f"{module_key}_card_upload_{base_signature}_{source}"
+        final_signature = card_state.get("result_signature") or _combo_card_signature(product, confirmed_combo_df)
+        upload_prefix = f"{module_key}_card_upload_{base_signature}_{final_signature}"
         result_key = f"{module_key}_card_result_{final_signature}"
 
         st.markdown("**4. 上传原图**")
         st.caption("支持批量上传，文件名请使用 1.png、001.png、14.jpg、014.webp 这类色号命名。")
-        bulk_files = st.file_uploader(
-            "批量上传当前产品色号原图",
-            type=["png", "jpg", "jpeg", "webp"],
-            accept_multiple_files=True,
-            key=f"{upload_prefix}_bulk",
-        )
-        uploaded_by_color, ignored_files, duplicate_files = index_uploaded_files_by_color(bulk_files, required_colors)
+        st.caption("未抠图白底单品图会自动尝试提取鱼饵主体；整张多色海报请先拆成单色图片后再上传。")
+        with st.form(f"{module_key}_card_upload_form_{final_signature}"):
+            bulk_files = st.file_uploader(
+                "批量上传当前产品色号原图",
+                type=["png", "jpg", "jpeg", "webp"],
+                accept_multiple_files=True,
+                key=f"{upload_prefix}_bulk",
+            )
+            with st.expander("逐色号补充/覆盖上传", expanded=False):
+                upload_cols = st.columns(4)
+                individual_uploads = {}
+                for idx, color in enumerate(required_colors):
+                    with upload_cols[idx % 4]:
+                        uploaded = st.file_uploader(
+                            f"{color} 原图",
+                            type=["png", "jpg", "jpeg", "webp"],
+                            key=f"{upload_prefix}_{color}",
+                        )
+                        if uploaded is not None:
+                            individual_uploads[color] = uploaded
+            confirm_upload = st.form_submit_button("确认上传文件", type="primary")
 
-        with st.expander("逐色号补充/覆盖上传", expanded=False):
-            upload_cols = st.columns(4)
-            for idx, color in enumerate(required_colors):
-                with upload_cols[idx % 4]:
-                    uploaded = st.file_uploader(
-                        f"{color} 原图",
-                        type=["png", "jpg", "jpeg", "webp"],
-                        key=f"{upload_prefix}_{final_signature}_{color}",
-                    )
-                    if uploaded is not None:
-                        uploaded_by_color[color] = uploaded
+        if confirm_upload:
+            uploaded_by_color, ignored_files, duplicate_files = index_uploaded_files_by_color(bulk_files, required_colors)
+            uploaded_by_color.update(individual_uploads)
+            uploaded_files = {
+                color: {"name": getattr(uploaded, "name", ""), "bytes": uploaded.getvalue()}
+                for color, uploaded in uploaded_by_color.items()
+            }
+            upload_name_map = {color: item["name"] for color, item in uploaded_files.items()}
+            missing = [color for color in required_colors if color not in uploaded_files]
+            card_state.update({
+                "uploaded_files": uploaded_files,
+                "uploaded_file_map": upload_name_map,
+                "missing_colors": missing,
+                "ignored_files": ignored_files,
+                "duplicate_files": duplicate_files,
+                "result": None,
+            })
+            if missing:
+                st.warning(f"缺少色号：{'、'.join(missing)}")
+            else:
+                st.success("上传文件已确认。")
 
-        matched = sorted(uploaded_by_color.keys(), key=lambda item: int(item))
-        missing = [color for color in required_colors if color not in uploaded_by_color]
+        uploaded_files = card_state.get("uploaded_files", {})
+        upload_name_map = card_state.get("uploaded_file_map", {})
+        missing = card_state.get("missing_colors", required_colors)
+        matched = sorted(uploaded_files.keys(), key=lambda item: int(item))
         if matched:
             st.caption(f"已识别色号：{'、'.join(matched)}")
-        if ignored_files:
-            st.caption("已忽略未匹配本次色号的文件：" + "、".join(str(name) for name in ignored_files if name))
-        if duplicate_files:
-            st.caption("存在重复上传，已使用最后一次识别到的文件：" + "、".join(str(name) for name in duplicate_files if name))
+        if card_state.get("ignored_files"):
+            st.caption("已忽略未匹配本次色号的文件：" + "、".join(str(name) for name in card_state["ignored_files"] if name))
+        if card_state.get("duplicate_files"):
+            st.caption("存在重复上传，已使用最后一次识别到的文件：" + "、".join(str(name) for name in card_state["duplicate_files"] if name))
         if missing:
             st.warning(f"缺少色号：{'、'.join(missing)}")
         else:
             st.success("本次组合所需色号已上传完整。")
 
         st.markdown("**5. 生成并下载**")
-        make_cards = st.button(
-            "生成组合色卡",
-            type="primary",
-            key=f"{module_key}_make_cards_{final_signature}",
-            disabled=bool(missing),
-        )
+        with st.form(f"{module_key}_card_generate_form_{final_signature}"):
+            auto_angle_correction = st.checkbox(
+                "自动校正鱼饵角度",
+                value=True,
+                help="明显过斜的原图会轻微转正；如果某批图转出来不自然，可以关闭后按原图角度生成。",
+            )
+            make_cards = st.form_submit_button(
+                "生成组合色卡",
+                type="primary",
+                disabled=bool(missing),
+            )
         if make_cards:
             try:
-                run_paths = create_card_run_dir(Path("web_runs"))
-                image_paths = {
-                    color: save_uploaded_color_image(uploaded, color, run_paths["raw_dir"])
-                    for color, uploaded in uploaded_by_color.items()
-                }
-                card_result = build_combo_cards(selected_combo_df, image_paths, run_paths)
-                st.session_state[result_key] = card_result
+                with st.status("正在生成组合色卡...", expanded=True) as status:
+                    progress = st.progress(0)
+                    status.write("正在检查上传文件")
+                    if confirmed_combo_df.empty:
+                        raise RuntimeError("当前未选择任何组合。")
+                    if missing:
+                        raise RuntimeError(f"缺少色号：{'、'.join(missing)}")
+                    selected_names = [upload_name_map.get(color, "") for color in required_colors]
+                    if len(selected_names) != len(set(selected_names)):
+                        raise RuntimeError("存在多个色号使用同一个上传文件，请检查上传映射。")
+
+                    run_paths = create_card_run_dir(Path("web_runs"))
+                    card_state["run_dir"] = str(run_paths["run_dir"])
+                    progress.progress(8)
+
+                    status.write("正在保存本次上传原图")
+                    raw_paths = {
+                        color: save_uploaded_color_bytes(
+                            uploaded_files[color]["name"],
+                            uploaded_files[color]["bytes"],
+                            color,
+                            run_paths["raw_dir"],
+                        )
+                        for color in required_colors
+                    }
+                    for color, raw_path in raw_paths.items():
+                        status.write(f"color {color} -> raw/{raw_path.name}")
+                    progress.progress(18)
+
+                    needs_model = False
+                    for raw_path in raw_paths.values():
+                        with Image.open(raw_path) as image:
+                            if not has_effective_alpha(image.convert("RGBA")):
+                                needs_model = True
+                                break
+
+                    rembg_session = None
+                    if needs_model:
+                        status.write(f"正在加载抠图模型：{MODEL_PATH}")
+                        rembg_session = get_birefnet_rembg_session()
+                    else:
+                        status.write("上传文件已包含有效透明通道，跳过模型抠图。")
+                    progress.progress(28)
+
+                    def cutout_progress(idx, total, message):
+                        status.write(message)
+                        progress.progress(min(78, 28 + int(idx / max(total, 1) * 50)))
+
+                    cutout_paths, cutout_warnings = prepare_cutouts(
+                        raw_paths,
+                        run_paths,
+                        rembg_session,
+                        progress_callback=cutout_progress,
+                    )
+                    cutout_errors = validate_cutout_paths(required_colors, cutout_paths)
+                    if cutout_errors:
+                        raise RuntimeError("；".join(cutout_errors))
+                    for color, cutout_path in cutout_paths.items():
+                        status.write(f"color {color} -> png/{cutout_path.name}")
+
+                    status.write("正在生成组合色卡并打包 ZIP")
+                    progress.progress(84)
+                    card_result = build_combo_cards(
+                        confirmed_combo_df,
+                        cutout_paths,
+                        run_paths,
+                        auto_angle_correction=auto_angle_correction,
+                        raw_paths=raw_paths,
+                        warnings=cutout_warnings,
+                    )
+                    st.session_state[result_key] = card_result
+                    card_state["result"] = card_result
+                    card_state["run_dir"] = str(run_paths["run_dir"])
+                    progress.progress(100)
+                    status.update(label="组合色卡生成完成", state="complete")
+
+                if card_result.warnings:
+                    for warning in card_result.warnings:
+                        st.warning(warning)
                 if card_result.missing_colors:
                     st.warning(f"以下色号缺少原图，相关色卡已跳过：{'、'.join(card_result.missing_colors)}")
                 elif not card_result.card_paths:
@@ -2176,9 +2345,11 @@ def render_combo_card_generator(combo_df, product, module_key):
             except Exception as exc:
                 st.error(f"生成组合色卡失败：{exc}")
 
-        card_result = st.session_state.get(result_key)
+        card_result = card_state.get("result") or st.session_state.get(result_key)
         if card_result and card_result.card_paths:
             st.caption(f"本次生成：{len(card_result.card_paths)} 张 PNG。")
+            st.caption(f"任务目录：{card_result.run_dir}")
+            st.caption(f"透明 PNG：{card_result.png_dir}｜Debug：{card_result.debug_dir}")
             if card_result.zip_path.exists():
                 st.download_button(
                     "下载全部 ZIP",
@@ -2379,70 +2550,144 @@ def render_product_combo_generator(orders, prod_df, module_key, cache_prefix,
         unsafe_allow_html=True,
     )
     product_options = get_product_options(prod_df)
-    input_cols = st.columns([1.25, 1.2, 0.85, 0.75, 0.8])
-    with input_cols[0]:
-        selected_product = st.selectbox(
-            "产品型号",
-            options=[""] + product_options,
-            format_func=lambda x: "选择产品型号" if x == "" else x,
-            key=f"{module_key}_product_select",
-        )
-    with input_cols[1]:
-        product_input = st.text_input("或输入产品型号", value="", placeholder="例如 LW546", key=f"{module_key}_product_input")
-    with input_cols[2]:
-        max_combos = st.slider("每产品最大组合数", 6, 10, 6, key=f"{module_key}_max_combos")
-    with input_cols[3]:
-        allow_repeat = st.checkbox("允许同色重复", value=True, key=f"{module_key}_allow_repeat")
-    with input_cols[4]:
-        st.write("")
-        generate_clicked = st.button("生成组合建议", type="primary", key=f"{module_key}_generate")
+    controls_key = f"{module_key}_combo_generator_controls"
+    controls_state = st.session_state.setdefault(controls_key, {
+        "product": "",
+        "product_input": "",
+        "max_combos": 6,
+        "allow_repeat": True,
+        "excluded_from_select": [],
+        "excluded_text": "",
+        "min_sales": 20,
+        "size_scope": "推荐尺寸（主推/次推/第三）",
+        "manual_combo_size": "自动判断",
+        "phase": "首批试单",
+    })
+    loaded_product = controls_state.get("product", "")
+    color_options = get_product_color_options(orders, loaded_product) if loaded_product else []
 
-    product = (product_input or selected_product or "").strip().upper()
-    excluded_from_select = []
-    manual_excluded = []
-    color_options = get_product_color_options(orders, product) if product else []
-    exclude_cols = st.columns([1.6, 1.1])
-    with exclude_cols[0]:
-        excluded_from_select = st.multiselect(
-            "排除色号",
-            options=color_options,
-            placeholder="请先选择产品型号" if not product else "选择不参与组合的色号",
-            disabled=not bool(product),
-            key=f"{module_key}_excluded_colors",
-        )
-    with exclude_cols[1]:
-        excluded_text = st.text_input(
-            "手动输入排除色号",
-            value="",
-            placeholder="例如 001,014,019",
-            disabled=not bool(product),
-            key=f"{module_key}_excluded_text",
-        )
+    with st.form(f"{module_key}_combo_generator_form"):
+        input_cols = st.columns([1.25, 1.2, 0.85, 0.75, 0.8, 0.95])
+        with input_cols[0]:
+            selected_product = st.selectbox(
+                "产品型号",
+                options=[""] + product_options,
+                index=([""] + product_options).index(loaded_product) if loaded_product in product_options else 0,
+                format_func=lambda x: "选择产品型号" if x == "" else x,
+            )
+        with input_cols[1]:
+            product_input = st.text_input(
+                "或输入产品型号",
+                value=controls_state.get("product_input", ""),
+                placeholder="例如 LW546",
+            )
+        with input_cols[2]:
+            max_combos = st.slider("每产品最大组合数", 6, 10, int(controls_state.get("max_combos", 6)))
+        with input_cols[3]:
+            allow_repeat = st.checkbox("允许同色重复", value=bool(controls_state.get("allow_repeat", True)))
+        with input_cols[4]:
+            load_colors_clicked = st.form_submit_button("加载产品色号")
+        with input_cols[5]:
+            generate_clicked = st.form_submit_button("生成组合建议", type="primary")
+
+        form_product = (product_input or selected_product or "").strip().upper()
+        exclude_cols = st.columns([1.6, 1.1])
+        current_excluded = [
+            color for color in controls_state.get("excluded_from_select", [])
+            if color in color_options
+        ]
+        with exclude_cols[0]:
+            excluded_from_select = st.multiselect(
+                "排除色号",
+                options=color_options,
+                default=current_excluded,
+                placeholder="先选择产品型号并点击“加载产品色号”" if not loaded_product else "选择不参与组合的色号",
+                disabled=not bool(loaded_product),
+            )
+        with exclude_cols[1]:
+            excluded_text = st.text_input(
+                "手动输入排除色号",
+                value=controls_state.get("excluded_text", ""),
+                placeholder="例如 001,014,019",
+                disabled=not bool(form_product or loaded_product),
+            )
+
+        with st.expander("高级筛选", expanded=False):
+            a1, a2, a3, a4 = st.columns([0.8, 1.1, 0.9, 1.0])
+            with a1:
+                min_sales = st.number_input("最低销量阈值", 1, 1000, int(controls_state.get("min_sales", 20)))
+            with a2:
+                size_options = ["推荐尺寸（主推/次推/第三）", "包含备选尺寸"]
+                size_scope = st.selectbox(
+                    "推荐尺寸范围",
+                    size_options,
+                    index=size_options.index(controls_state.get("size_scope", size_options[0]))
+                    if controls_state.get("size_scope", size_options[0]) in size_options else 0,
+                )
+            with a3:
+                combo_size_options = ["自动判断", 2, 3, 4, 5, 6]
+                manual_combo_size = st.selectbox(
+                    "组合件数",
+                    combo_size_options,
+                    index=combo_size_options.index(controls_state.get("manual_combo_size", "自动判断"))
+                    if controls_state.get("manual_combo_size", "自动判断") in combo_size_options else 0,
+                )
+            with a4:
+                phase_options = ["首批试单", "成熟复购"]
+                phase = st.selectbox(
+                    "组合阶段",
+                    phase_options,
+                    index=phase_options.index(controls_state.get("phase", "首批试单"))
+                    if controls_state.get("phase", "首批试单") in phase_options else 0,
+                    help="首批试单：只押验证过能卖的色，控海外仓压货风险；成熟复购：跑出复购后再做色卡覆盖、带长尾。",
+                )
+            st.caption(f"当前数据范围：{default_country_label}。筛选条件只影响当前产品组合生成。")
+
+    if load_colors_clicked or generate_clicked:
+        product = (product_input or selected_product or "").strip().upper()
         manual_excluded = parse_excluded_colors(excluded_text) if product else []
+        if product != loaded_product:
+            excluded_from_select = []
+        excluded_colors = sorted(set(excluded_from_select) | set(manual_excluded))
+        controls_state.update({
+            "product": product,
+            "product_input": product_input,
+            "max_combos": int(max_combos),
+            "allow_repeat": bool(allow_repeat),
+            "excluded_from_select": excluded_from_select,
+            "excluded_text": excluded_text,
+            "min_sales": int(min_sales),
+            "size_scope": size_scope,
+            "manual_combo_size": manual_combo_size,
+            "phase": phase,
+        })
+        if load_colors_clicked and not generate_clicked:
+            if not product:
+                st.info("请先选择或输入产品型号。")
+            else:
+                rerun = getattr(st, "rerun", None) or getattr(st, "experimental_rerun", None)
+                if rerun:
+                    rerun()
+                st.info("已加载产品色号，可继续选择排除色号后生成组合建议。")
+    else:
+        product = loaded_product
+        max_combos = int(controls_state.get("max_combos", 6))
+        allow_repeat = bool(controls_state.get("allow_repeat", True))
+        min_sales = int(controls_state.get("min_sales", 20))
+        size_scope = controls_state.get("size_scope", "推荐尺寸（主推/次推/第三）")
+        manual_combo_size = controls_state.get("manual_combo_size", "自动判断")
+        phase = controls_state.get("phase", "首批试单")
+        excluded_colors = sorted(
+            set(controls_state.get("excluded_from_select", [])) |
+            set(parse_excluded_colors(controls_state.get("excluded_text", "")) if product else [])
+        )
+
     if product:
-        if not color_options:
+        active_color_options = get_product_color_options(orders, product)
+        if not active_color_options:
             st.caption("当前产品暂无可识别的 001-030 色号。")
     else:
-        st.caption("请先选择产品型号后再选择排除色号。")
-    excluded_colors = sorted(set(excluded_from_select) | set(manual_excluded))
-
-    with st.expander("高级筛选", expanded=False):
-        a1, a2, a3, a4 = st.columns([0.8, 1.1, 0.9, 1.0])
-        with a1:
-            min_sales = st.number_input("最低销量阈值", 1, 1000, 20, key=f"{module_key}_min_sales")
-        with a2:
-            size_scope = st.selectbox("推荐尺寸范围", ["推荐尺寸（主推/次推/第三）", "包含备选尺寸"], key=f"{module_key}_size_scope")
-        with a3:
-            manual_combo_size = st.selectbox("组合件数", ["自动判断", 2, 3, 4, 5, 6], key=f"{module_key}_manual_combo_size")
-        with a4:
-            phase = st.selectbox(
-                "组合阶段",
-                ["首批试单", "成熟复购"],
-                index=0,
-                key=f"{module_key}_phase",
-                help="首批试单：只押验证过能卖的色，控海外仓压货风险；成熟复购：跑出复购后再做色卡覆盖、带长尾。",
-            )
-        st.caption(f"当前数据范围：{default_country_label}。筛选条件只影响当前产品组合生成。")
+        st.caption("请先选择产品型号，点击“加载产品色号”后再选择排除色号。")
 
     if generate_clicked:
         force = None if manual_combo_size == "自动判断" else int(manual_combo_size)

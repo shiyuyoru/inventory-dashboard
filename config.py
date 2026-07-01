@@ -4,7 +4,7 @@ Keep these values aligned with the current production logic unless the
 business rules intentionally change.
 """
 
-APP_VERSION = "v5.4.01"
+APP_VERSION = "v5.4.06"
 
 PRODUCT_RECOMMEND_STRONG_SALES = 100
 PRODUCT_RECOMMEND_NORMAL_SALES = 50

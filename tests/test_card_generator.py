@@ -11,8 +11,12 @@ from card_generator import (
     color_code_from_filename,
     combo_filename,
     create_card_run_dir,
+    extract_lure_from_poster,
     index_uploaded_files_by_color,
     parse_custom_combo_text,
+    prepare_cutouts,
+    suppress_soft_shadow,
+    validate_cutout_paths,
 )
 
 
@@ -64,6 +68,32 @@ class CardGeneratorTests(unittest.TestCase):
         self.assertIn("不是数字", errors[0])
         self.assertIn("超出", errors[1])
         self.assertIn("至少需要 2 个色号", errors[2])
+
+    def test_extract_lure_from_poster_ignores_title_and_color_label(self):
+        image = Image.new("RGB", (900, 520), "white")
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((80, 45, 260, 70), fill=(30, 30, 30))
+        draw.text((80, 78), "NEEDLE STYLO", fill=(20, 20, 20))
+        draw.rounded_rectangle((170, 230, 760, 315), radius=40, fill=(50, 150, 210))
+        draw.ellipse((180, 245, 230, 295), fill=(245, 245, 245))
+        draw.text((430, 420), "005", fill=(40, 160, 210))
+
+        extracted = extract_lure_from_poster(image)
+
+        self.assertIsNotNone(extracted)
+        self.assertGreater(extracted.width / extracted.height, 3)
+        self.assertLess(extracted.height, 160)
+
+    def test_suppress_soft_shadow_keeps_colored_lure(self):
+        image = Image.new("RGBA", (120, 40), "white")
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((10, 24, 110, 32), fill=(224, 224, 224, 255))
+        draw.rectangle((20, 10, 100, 20), fill=(40, 140, 220, 255))
+
+        cleaned = suppress_soft_shadow(image)
+
+        self.assertEqual(cleaned.getpixel((30, 28))[:3], (255, 255, 255))
+        self.assertEqual(cleaned.getpixel((30, 15))[:3], (40, 140, 220))
 
     def test_build_combo_cards_creates_png_and_zip(self):
         combo_df = pd.DataFrame({"推荐组合色号": ["003、001、014"]})
@@ -141,6 +171,26 @@ class CardGeneratorTests(unittest.TestCase):
             result = build_combo_cards(combo_df, image_paths, run_paths)
 
             self.assertEqual([p.name for p in result.card_paths], ["34.png"])
+
+    def test_prepare_cutouts_skips_valid_transparent_png_without_warning(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_paths = create_card_run_dir(Path(tmp) / "web_runs")
+            raw_paths = {}
+            for color in ["009", "016"]:
+                path = run_paths["raw_dir"] / f"{color}.png"
+                image = Image.new("RGBA", (520, 130), (255, 255, 255, 0))
+                draw = ImageDraw.Draw(image)
+                draw.rounded_rectangle((20, 28, 500, 102), radius=32, fill=(80, 150, 220, 255))
+                image.save(path)
+                raw_paths[color] = path
+
+            cutout_paths, warnings = prepare_cutouts(raw_paths, run_paths, rembg_session=None)
+
+            self.assertEqual(warnings, [])
+            self.assertEqual(sorted(cutout_paths), ["009", "016"])
+            self.assertEqual(validate_cutout_paths(["009", "016"], cutout_paths), [])
+            self.assertTrue((run_paths["debug_dir"] / "009" / "final_cutout.png").exists())
+            self.assertIn("skipped rembg", (run_paths["debug_dir"] / "mapping.log").read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
