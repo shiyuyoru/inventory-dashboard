@@ -124,6 +124,58 @@ def parse_combo_colors(combo_value) -> list[str]:
     return [color for color in colors if color]
 
 
+def format_combo_colors(colors: Iterable[str]) -> str:
+    normalized = [normalize_color_code(color) for color in colors]
+    valid = [color for color in normalized if color]
+    return "、".join(sorted(valid, key=lambda item: int(item)))
+
+
+def parse_custom_combo_text(text: str) -> tuple[list[list[str]], list[str]]:
+    combos: list[list[str]] = []
+    errors: list[str] = []
+    seen: set[tuple[str, ...]] = set()
+
+    for line_no, raw_line in enumerate(str(text or "").splitlines(), start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        tokens = [token for token in re.split(r"[\s,，、/;+]+", line) if token]
+        if not tokens:
+            errors.append(f"第 {line_no} 行为空组合。")
+            continue
+
+        colors: list[str] = []
+        line_errors: list[str] = []
+        for token in tokens:
+            if not token.isdigit():
+                line_errors.append(f"{token} 不是数字")
+                continue
+            color = normalize_color_code(token)
+            if not color:
+                line_errors.append(f"{token} 超出 001-030")
+                continue
+            colors.append(color)
+
+        if line_errors:
+            errors.append(f"第 {line_no} 行无效：" + "，".join(line_errors) + "。")
+            continue
+        if len(colors) < 2:
+            errors.append(f"第 {line_no} 行无效：组合至少需要 2 个色号。")
+            continue
+        if len(colors) > 6:
+            errors.append(f"第 {line_no} 行无效：组合最多支持 6 个色号。")
+            continue
+
+        key = tuple(sorted(colors, key=lambda item: int(item)))
+        if key in seen:
+            continue
+        seen.add(key)
+        combos.append(list(key))
+
+    return combos, errors
+
+
 def collect_required_colors(combo_df, combo_col: str = "推荐组合色号") -> list[str]:
     if combo_df is None or combo_df.empty or combo_col not in combo_df.columns:
         return []

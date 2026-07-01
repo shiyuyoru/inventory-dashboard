@@ -14,7 +14,9 @@ from card_generator import (
     build_combo_cards,
     collect_required_colors,
     create_card_run_dir,
+    format_combo_colors,
     index_uploaded_files_by_color,
+    parse_custom_combo_text,
     save_uploaded_color_image,
 )
 from config import (
@@ -2025,25 +2027,97 @@ def _combo_card_signature(product, combo_df):
 
 
 def render_combo_card_generator(combo_df, product, module_key):
-    required_colors = collect_required_colors(combo_df)
-    if not required_colors:
+    if combo_df is None or combo_df.empty or "推荐组合色号" not in combo_df.columns:
         return
 
-    signature = _combo_card_signature(product, combo_df)
-    upload_prefix = f"{module_key}_card_upload_{signature}"
-    result_key = f"{module_key}_card_result_{signature}"
+    base_signature = _combo_card_signature(product, combo_df)
 
     with st.expander("组合色卡生成", expanded=False):
         st.markdown(f"**当前产品：** `{product}`")
-        preview_cols = [c for c in ["推荐组合色号", "组合类型", "组合件数"] if c in combo_df.columns]
-        if preview_cols:
-            st.dataframe(combo_df[preview_cols], use_container_width=True, hide_index=True, height=180)
-        st.caption(
-            "本次需要上传色号："
-            + "、".join(required_colors)
-            + "。支持批量上传，文件名请使用 1.png、001.png、14.jpg、014.webp 这类色号命名。"
+        st.markdown("**1. 选择组合来源**")
+        source = st.radio(
+            "组合来源",
+            ["使用推荐组合", "自定义组合"],
+            horizontal=True,
+            key=f"{module_key}_card_source_{base_signature}",
         )
 
+        st.markdown("**2. 确定本次要做的组合**")
+        selected_combo_df = pd.DataFrame(columns=combo_df.columns)
+        custom_errors = []
+
+        if source == "使用推荐组合":
+            rec_df = combo_df.reset_index(drop=True).copy()
+            st.caption("勾选这次要生成色卡的推荐组合。未勾选的组合不会要求上传图片，也不会生成。")
+            selected_indices = []
+            pick_cols = st.columns(2)
+            for idx, row in rec_df.iterrows():
+                combo_text = str(row.get("推荐组合色号", "")).strip()
+                combo_type = str(row.get("组合类型", "")).strip()
+                combo_size = str(row.get("组合件数", "")).strip()
+                label_parts = [combo_text]
+                if combo_type:
+                    label_parts.append(combo_type)
+                if combo_size:
+                    label_parts.append(f"{combo_size}件")
+                with pick_cols[idx % 2]:
+                    checked = st.checkbox(
+                        "｜".join(label_parts),
+                        value=False,
+                        key=f"{module_key}_card_pick_{base_signature}_{idx}",
+                    )
+                if checked:
+                    selected_indices.append(idx)
+            if selected_indices:
+                selected_combo_df = rec_df.iloc[selected_indices].copy()
+            else:
+                st.info("请先选择至少一个组合。")
+        else:
+            custom_text = st.text_area(
+                "自定义组合",
+                value="",
+                height=130,
+                placeholder="每行一个组合，例如：\n3,4\n1,5\n3,4,5,6",
+                key=f"{module_key}_card_custom_text_{base_signature}",
+            )
+            custom_combos, custom_errors = parse_custom_combo_text(custom_text)
+            for error in custom_errors:
+                st.warning(error)
+            if custom_combos:
+                selected_combo_df = pd.DataFrame({
+                    "产品型号": product,
+                    "推荐组合色号": [format_combo_colors(colors) for colors in custom_combos],
+                    "组合类型": "自定义组合",
+                    "组合件数": [len(colors) for colors in custom_combos],
+                })
+            elif custom_text.strip() and not custom_errors:
+                st.info("请先输入至少一个有效组合。")
+            elif not custom_text.strip():
+                st.info("请输入要生成的组合，每行一个。")
+
+        display_cols = [c for c in ["推荐组合色号", "组合类型", "组合件数"] if c in selected_combo_df.columns]
+        if selected_combo_df.empty:
+            st.caption("当前已选组合：暂无")
+        else:
+            st.caption(f"当前已选组合：{len(selected_combo_df)} 组")
+            st.dataframe(selected_combo_df[display_cols], use_container_width=True, hide_index=True, height=160)
+
+        st.markdown("**3. 显示本次需要上传的色号**")
+        required_colors = collect_required_colors(selected_combo_df)
+        if required_colors:
+            st.caption("本次需要上传色号：" + "、".join(required_colors))
+        else:
+            st.info("选择组合后会在这里显示需要上传的色号。")
+
+        if selected_combo_df.empty or not required_colors or custom_errors:
+            return
+
+        final_signature = _combo_card_signature(product, selected_combo_df)
+        upload_prefix = f"{module_key}_card_upload_{base_signature}_{source}"
+        result_key = f"{module_key}_card_result_{final_signature}"
+
+        st.markdown("**4. 上传原图**")
+        st.caption("支持批量上传，文件名请使用 1.png、001.png、14.jpg、014.webp 这类色号命名。")
         bulk_files = st.file_uploader(
             "批量上传当前产品色号原图",
             type=["png", "jpg", "jpeg", "webp"],
@@ -2059,7 +2133,7 @@ def render_combo_card_generator(combo_df, product, module_key):
                     uploaded = st.file_uploader(
                         f"{color} 原图",
                         type=["png", "jpg", "jpeg", "webp"],
-                        key=f"{upload_prefix}_{color}",
+                        key=f"{upload_prefix}_{final_signature}_{color}",
                     )
                     if uploaded is not None:
                         uploaded_by_color[color] = uploaded
@@ -2077,10 +2151,11 @@ def render_combo_card_generator(combo_df, product, module_key):
         else:
             st.success("本次组合所需色号已上传完整。")
 
+        st.markdown("**5. 生成并下载**")
         make_cards = st.button(
             "生成组合色卡",
             type="primary",
-            key=f"{module_key}_make_cards_{signature}",
+            key=f"{module_key}_make_cards_{final_signature}",
             disabled=bool(missing),
         )
         if make_cards:
@@ -2090,7 +2165,7 @@ def render_combo_card_generator(combo_df, product, module_key):
                     color: save_uploaded_color_image(uploaded, color, run_paths["raw_dir"])
                     for color, uploaded in uploaded_by_color.items()
                 }
-                card_result = build_combo_cards(combo_df, image_paths, run_paths)
+                card_result = build_combo_cards(selected_combo_df, image_paths, run_paths)
                 st.session_state[result_key] = card_result
                 if card_result.missing_colors:
                     st.warning(f"以下色号缺少原图，相关色卡已跳过：{'、'.join(card_result.missing_colors)}")
@@ -2110,7 +2185,7 @@ def render_combo_card_generator(combo_df, product, module_key):
                     data=card_result.zip_path.read_bytes(),
                     file_name="组合色卡.zip",
                     mime="application/zip",
-                    key=f"{module_key}_download_zip_{signature}",
+                    key=f"{module_key}_download_zip_{final_signature}",
                 )
 
             preview_cols = st.columns(4)
@@ -2122,7 +2197,7 @@ def render_combo_card_generator(combo_df, product, module_key):
                         data=card_path.read_bytes(),
                         file_name=card_path.name,
                         mime="image/png",
-                        key=f"{module_key}_download_card_{signature}_{idx}",
+                        key=f"{module_key}_download_card_{final_signature}_{idx}",
                     )
 
 

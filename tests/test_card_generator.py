@@ -12,6 +12,7 @@ from card_generator import (
     combo_filename,
     create_card_run_dir,
     index_uploaded_files_by_color,
+    parse_custom_combo_text,
 )
 
 
@@ -44,6 +45,25 @@ class CardGeneratorTests(unittest.TestCase):
         self.assertEqual(ignored, ["14.webp"])
         self.assertEqual(duplicates, [])
         self.assertEqual([c for c in required if c not in indexed], ["003", "004", "005", "006"])
+
+    def test_parse_custom_combo_text(self):
+        combos, errors = parse_custom_combo_text("3,4\n1，5\n 3, 4, 5, 6\n\n")
+
+        self.assertEqual(combos, [
+            ["003", "004"],
+            ["001", "005"],
+            ["003", "004", "005", "006"],
+        ])
+        self.assertEqual(errors, [])
+
+    def test_parse_custom_combo_text_reports_invalid_lines(self):
+        combos, errors = parse_custom_combo_text("3,abc\n31,4\n5")
+
+        self.assertEqual(combos, [])
+        self.assertEqual(len(errors), 3)
+        self.assertIn("不是数字", errors[0])
+        self.assertIn("超出", errors[1])
+        self.assertIn("至少需要 2 个色号", errors[2])
 
     def test_build_combo_cards_creates_png_and_zip(self):
         combo_df = pd.DataFrame({"推荐组合色号": ["003、001、014"]})
@@ -103,6 +123,24 @@ class CardGeneratorTests(unittest.TestCase):
             for card_path in result.card_paths:
                 with Image.open(card_path) as card:
                     self.assertEqual(card.size, (1000, 1000))
+
+    def test_build_cards_only_uses_selected_combo_df(self):
+        combo_df = pd.DataFrame({"推荐组合色号": ["003、004"]})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_paths = create_card_run_dir(Path(tmp) / "web_runs")
+            image_paths = {}
+            for color in ["003", "004"]:
+                path = run_paths["raw_dir"] / f"{color}.png"
+                image = Image.new("RGBA", (500, 120), (255, 255, 255, 0))
+                draw = ImageDraw.Draw(image)
+                draw.rounded_rectangle((20, 20, 480, 100), radius=30, fill=(180, 80, 120, 255))
+                image.save(path)
+                image_paths[color] = path
+
+            result = build_combo_cards(combo_df, image_paths, run_paths)
+
+            self.assertEqual([p.name for p in result.card_paths], ["34.png"])
 
 
 if __name__ == "__main__":
