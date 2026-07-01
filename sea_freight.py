@@ -9,6 +9,14 @@ import io
 import json
 import hashlib
 from itertools import combinations, combinations_with_replacement, product
+from pathlib import Path
+from card_generator import (
+    build_combo_cards,
+    collect_required_colors,
+    create_card_run_dir,
+    index_uploaded_files_by_color,
+    save_uploaded_color_image,
+)
 from config import (
     FORCED_WEAK_COLOR_RATIO,
     HOT_COLOR_RATIO,
@@ -2008,6 +2016,116 @@ def get_product_color_options(orders, product):
     return sorted({c for c in colors if is_valid_normalized_color(c)})
 
 
+def _combo_card_signature(product, combo_df):
+    combos = []
+    if combo_df is not None and not combo_df.empty and "推荐组合色号" in combo_df.columns:
+        combos = combo_df["推荐组合色号"].fillna("").astype(str).tolist()
+    raw = json.dumps({"product": product, "combos": combos}, ensure_ascii=False, sort_keys=True)
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def render_combo_card_generator(combo_df, product, module_key):
+    required_colors = collect_required_colors(combo_df)
+    if not required_colors:
+        return
+
+    signature = _combo_card_signature(product, combo_df)
+    upload_prefix = f"{module_key}_card_upload_{signature}"
+    result_key = f"{module_key}_card_result_{signature}"
+
+    with st.expander("组合色卡生成", expanded=False):
+        st.markdown(f"**当前产品：** `{product}`")
+        preview_cols = [c for c in ["推荐组合色号", "组合类型", "组合件数"] if c in combo_df.columns]
+        if preview_cols:
+            st.dataframe(combo_df[preview_cols], use_container_width=True, hide_index=True, height=180)
+        st.caption(
+            "本次需要上传色号："
+            + "、".join(required_colors)
+            + "。支持批量上传，文件名请使用 1.png、001.png、14.jpg、014.webp 这类色号命名。"
+        )
+
+        bulk_files = st.file_uploader(
+            "批量上传当前产品色号原图",
+            type=["png", "jpg", "jpeg", "webp"],
+            accept_multiple_files=True,
+            key=f"{upload_prefix}_bulk",
+        )
+        uploaded_by_color, ignored_files, duplicate_files = index_uploaded_files_by_color(bulk_files, required_colors)
+
+        with st.expander("逐色号补充/覆盖上传", expanded=False):
+            upload_cols = st.columns(4)
+            for idx, color in enumerate(required_colors):
+                with upload_cols[idx % 4]:
+                    uploaded = st.file_uploader(
+                        f"{color} 原图",
+                        type=["png", "jpg", "jpeg", "webp"],
+                        key=f"{upload_prefix}_{color}",
+                    )
+                    if uploaded is not None:
+                        uploaded_by_color[color] = uploaded
+
+        matched = sorted(uploaded_by_color.keys(), key=lambda item: int(item))
+        missing = [color for color in required_colors if color not in uploaded_by_color]
+        if matched:
+            st.caption(f"已识别色号：{'、'.join(matched)}")
+        if ignored_files:
+            st.caption("已忽略未匹配本次色号的文件：" + "、".join(str(name) for name in ignored_files if name))
+        if duplicate_files:
+            st.caption("存在重复上传，已使用最后一次识别到的文件：" + "、".join(str(name) for name in duplicate_files if name))
+        if missing:
+            st.warning(f"缺少色号：{'、'.join(missing)}")
+        else:
+            st.success("本次组合所需色号已上传完整。")
+
+        make_cards = st.button(
+            "生成组合色卡",
+            type="primary",
+            key=f"{module_key}_make_cards_{signature}",
+            disabled=bool(missing),
+        )
+        if make_cards:
+            try:
+                run_paths = create_card_run_dir(Path("web_runs"))
+                image_paths = {
+                    color: save_uploaded_color_image(uploaded, color, run_paths["raw_dir"])
+                    for color, uploaded in uploaded_by_color.items()
+                }
+                card_result = build_combo_cards(combo_df, image_paths, run_paths)
+                st.session_state[result_key] = card_result
+                if card_result.missing_colors:
+                    st.warning(f"以下色号缺少原图，相关色卡已跳过：{'、'.join(card_result.missing_colors)}")
+                elif not card_result.card_paths:
+                    st.warning("没有生成可下载的色卡，请检查推荐组合和上传图片。")
+                else:
+                    st.success(f"已生成 {len(card_result.card_paths)} 张组合色卡。")
+            except Exception as exc:
+                st.error(f"生成组合色卡失败：{exc}")
+
+        card_result = st.session_state.get(result_key)
+        if card_result and card_result.card_paths:
+            st.caption(f"本次生成：{len(card_result.card_paths)} 张 PNG。")
+            if card_result.zip_path.exists():
+                st.download_button(
+                    "下载全部 ZIP",
+                    data=card_result.zip_path.read_bytes(),
+                    file_name="组合色卡.zip",
+                    mime="application/zip",
+                    key=f"{module_key}_download_zip_{signature}",
+                )
+
+            preview_cols = st.columns(4)
+            for idx, card_path in enumerate(card_result.card_paths):
+                with preview_cols[idx % 4]:
+                    st.image(str(card_path), caption=card_path.name, use_container_width=True)
+                    st.download_button(
+                        "下载 PNG",
+                        data=card_path.read_bytes(),
+                        file_name=card_path.name,
+                        mime="image/png",
+                        key=f"{module_key}_download_card_{signature}_{idx}",
+                    )
+
+
 def make_cache_key(namespace, **params):
     normalized = json.dumps(params, ensure_ascii=False, sort_keys=True, default=str)
     digest = hashlib.md5(normalized.encode("utf-8")).hexdigest()
@@ -2309,6 +2427,7 @@ def render_product_combo_generator(orders, prod_df, module_key, cache_prefix,
         else:
             st.caption(f"已按当前设置生成 {result.get('generated_count', len(result['combo_df']))} / {result.get('target_combos', len(result['combo_df']))} 组。")
         show_table(result["combo_df"], text_cols=["推荐理由", "注意事项"], height=420)
+        render_combo_card_generator(result["combo_df"], result["product"], module_key)
 
     notes = []
     if result["weak_combo"]:
